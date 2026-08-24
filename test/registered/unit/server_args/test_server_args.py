@@ -23,6 +23,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    default_cuda_graph_config,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
@@ -1132,6 +1133,84 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.deepep_mode, "low_latency")
         self.assertFalse(server_args.disable_cuda_graph)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
+class TestDeepEPStreamingArgs(CustomTestCase):
+    @staticmethod
+    def _args(**overrides):
+        kwargs = dict(
+            model_path="dummy",
+            device="cuda",
+            tp_size=8,
+            dp_size=8,
+            ep_size=8,
+            enable_dp_attention=True,
+            moe_a2a_backend="deepep",
+            moe_runner_backend="auto",
+            deepep_mode="auto",
+            enable_deepep_streaming=True,
+            cuda_graph_config=default_cuda_graph_config(),
+        )
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_cli_flag_is_registered(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            ["--model", "dummy", "--enable-deepep-streaming"]
+        )
+        self.assertTrue(parsed.enable_deepep_streaming)
+
+    def test_streaming_resolves_safe_runtime_configuration(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args()
+            server_args._handle_a2a_moe()
+
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            view = resolved_view(server_args)
+            self.assertTrue(server_args.enable_deepep_streaming)
+            self.assertTrue(envs.SGLANG_ENABLE_DEEPEP_STREAMING.get())
+            self.assertEqual(server_args.deepep_mode, "normal")
+            self.assertEqual(view.moe_runner_backend, "deep_gemm")
+            self.assertTrue(view.disable_shared_experts_fusion)
+            self.assertEqual(
+                server_args.cuda_graph_config.decode.backend, Backend.DISABLED
+            )
+            self.assertEqual(
+                server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+            )
+
+    def test_legacy_environment_gate_uses_same_validation(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(True):
+            server_args = self._args(enable_deepep_streaming=False)
+            server_args._handle_a2a_moe()
+            self.assertTrue(server_args.enable_deepep_streaming)
+
+    def test_streaming_rejects_incompatible_backend(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(moe_a2a_backend="none")
+            with self.assertRaisesRegex(ValueError, "moe-a2a-backend deepep"):
+                server_args._handle_a2a_moe()
+
+    def test_streaming_rejects_low_latency_mode(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(deepep_mode="low_latency")
+            with self.assertRaisesRegex(ValueError, "deepep-mode normal"):
+                server_args._handle_a2a_moe()
+
+    def test_streaming_rejects_fp8_checkpoint(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(quantization="fp8")
+            with self.assertRaisesRegex(ValueError, "FP8 streaming runner"):
+                server_args._handle_a2a_moe()
+
+    def test_streaming_rejects_non_ep8_topology(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(tp_size=4, dp_size=4, ep_size=4)
+            with self.assertRaisesRegex(ValueError, "requires TP8 and EP8"):
+                server_args._handle_a2a_moe()
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

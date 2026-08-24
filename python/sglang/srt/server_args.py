@@ -1967,6 +1967,14 @@ class ServerArgs:
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
+    enable_deepep_streaming: A[
+        bool,
+        "Enable the experimental inference-only lane-streaming DeepEP path. "
+        "The current milestone requires NVIDIA CUDA, TP8 with DP attention "
+        "and DP8, EP8/MoE-TP1, unquantized BF16 experts, DeepGEMM, and "
+        "DeepEP normal mode. CUDA graphs and shared-expert fusion are "
+        "disabled automatically.",
+    ] = False
     fuseep_mode: A[
         Literal[1, 2],
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
@@ -5799,6 +5807,130 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
+    def _configure_streaming_moe(self, a2a_backend: str) -> None:
+        """Resolve and validate the experimental lane-streaming MoE path.
+
+        Keep the environment-variable gate working for existing experiments,
+        but publish the effective setting on ``ServerArgs`` so launchers and
+        worker processes can inspect one resolved configuration.  Shape checks
+        that require instantiated MoE weights remain in ``FusedMoE``.
+        """
+        enabled = (
+            self.enable_deepep_streaming
+            or envs.SGLANG_ENABLE_DEEPEP_STREAMING.get()
+        )
+        if not enabled:
+            return
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        view = resolved_view(self)
+        if a2a_backend != "deepep":
+            raise ValueError(
+                "--enable-deepep-streaming requires --moe-a2a-backend deepep"
+            )
+        if view.ep_size != 8 or self.tp_size != 8:
+            raise ValueError(
+                "--enable-deepep-streaming currently requires TP8 and EP8 "
+                f"(got tp_size={self.tp_size}, ep_size={view.ep_size})"
+            )
+        if not view.enable_dp_attention or self.dp_size != 8:
+            raise ValueError(
+                "--enable-deepep-streaming currently requires "
+                "--enable-dp-attention --dp-size 8"
+            )
+        if self.moe_dp_size != 1 or self.pp_size != 1:
+            raise ValueError(
+                "--enable-deepep-streaming currently requires MoE DP1 and PP1"
+            )
+        if self.device not in (None, "cuda") or is_hip() or is_npu():
+            raise ValueError(
+                "--enable-deepep-streaming currently supports NVIDIA CUDA only"
+            )
+        if self.deepep_mode == "low_latency":
+            raise ValueError(
+                "--enable-deepep-streaming requires --deepep-mode normal"
+            )
+        if view.moe_runner_backend not in ("auto", "deep_gemm"):
+            raise ValueError(
+                "--enable-deepep-streaming requires "
+                "--moe-runner-backend deep_gemm"
+            )
+        if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+            raise ValueError(
+                "--enable-deepep-streaming does not yet support TBO or SBO"
+            )
+        if self.enable_waterfill or self.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-deepep-streaming does not support Waterfill or "
+                "enforced shared-expert fusion"
+            )
+        if (
+            self.enable_eplb
+            or self.ep_num_redundant_experts != 0
+            or self.init_expert_location != "trivial"
+            or self.elastic_ep_backend is not None
+            or self.ep_join_mode is not None
+        ):
+            raise ValueError(
+                "--enable-deepep-streaming currently requires a static, "
+                "non-redundant expert layout"
+            )
+
+        model_quantization = None
+        if self.model_path.lower() not in ("none", "dummy"):
+            import torch
+
+            model_config = self.get_model_config()
+            model_quantization = get_quantization_config(model_config.hf_config)
+            if model_config.dtype != torch.bfloat16:
+                raise ValueError(
+                    "--enable-deepep-streaming currently requires BF16 model "
+                    f"weights (resolved dtype={model_config.dtype})"
+                )
+
+            text_config = model_config.hf_text_config
+            if (
+                model_quantization is None
+                and text_config is not model_config.hf_config
+            ):
+                model_quantization = get_quantization_config(text_config)
+            router_topk = getattr(text_config, "num_experts_per_tok", None)
+            num_experts = getattr(text_config, "n_routed_experts", None)
+            if num_experts is None:
+                num_experts = getattr(text_config, "num_experts", None)
+            if router_topk is not None and router_topk < 8:
+                raise ValueError(
+                    "--enable-deepep-streaming requires router top-k >= EP size"
+                )
+            if num_experts is not None and num_experts % 8 != 0:
+                raise ValueError(
+                    "--enable-deepep-streaming requires equal experts per EP rank"
+                )
+
+        if view.quantization is not None or model_quantization is not None:
+            quantization = view.quantization or model_quantization
+            raise ValueError(
+                "--enable-deepep-streaming currently supports only unquantized "
+                f"BF16 experts; checkpoint quantization is {quantization!r}. "
+                "The FP8 streaming runner is not implemented yet."
+            )
+
+        overrides = {"disable_shared_experts_fusion": True}
+        if view.moe_runner_backend == "auto":
+            overrides["moe_runner_backend"] = "deep_gemm"
+        self.override("deepep_streaming", **overrides)
+
+        if self.deepep_mode == "auto":
+            self.deepep_mode = "normal"
+        self.enable_deepep_streaming = True
+        envs.SGLANG_ENABLE_DEEPEP_STREAMING.set(True)
+        logger.warning(
+            "Experimental lane-streaming DeepEP is enabled: normal mode, "
+            "DeepGEMM, EP8/MoE-TP1, and BF16 experts. CUDA graphs and "
+            "shared-expert fusion are disabled."
+        )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -5821,6 +5953,7 @@ class ServerArgs:
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
         a2a_backend = resolved_view(self).moe_a2a_backend
+        self._configure_streaming_moe(a2a_backend)
         if self.enable_waterfill:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")

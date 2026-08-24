@@ -29,6 +29,8 @@ def test_streaming_environment_enables_required_protocol(monkeypatch):
         "EP_EXPERIMENTAL_RANK_READY",
         "EP_EXPERIMENTAL_STREAMING_LANES",
         "EP_EXPERIMENTAL_STREAMING_LAYER",
+        "EP_REUSE_NCCL_COMM",
+        "NCCL_CUMEM_ENABLE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -36,6 +38,14 @@ def test_streaming_environment_enables_required_protocol(monkeypatch):
 
     assert os.environ["EP_EXPERIMENTAL_STREAMING_LANES"] == "1"
     assert os.environ["EP_EXPERIMENTAL_STREAMING_LAYER"] == "1"
+    assert os.environ["EP_REUSE_NCCL_COMM"] == "0"
+    assert os.environ["NCCL_CUMEM_ENABLE"] == "1"
+
+
+def test_streaming_environment_rejects_disabled_nccl_cumem(monkeypatch):
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
+    with pytest.raises(RuntimeError, match="NCCL_CUMEM_ENABLE=1"):
+        configure_deepep_streaming_environment()
 
 
 def test_streaming_dispatch_rejects_incomplete_runtime_view():

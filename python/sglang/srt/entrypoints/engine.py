@@ -1257,8 +1257,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
-    if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+    requires_nccl_cumem = (
+        server_args.enable_symm_mem or server_args.enable_deepep_streaming
+    )
+    if "NCCL_CUMEM_ENABLE" not in os.environ or requires_nccl_cumem:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(requires_nccl_cumem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or server_args.enable_nccl_nvls

@@ -21,6 +21,13 @@ from sglang.srt.environ import envs
 _DEEPEP_STREAMING_REQUIRED_ENV = {
     "EP_EXPERIMENTAL_STREAMING_LANES": "1",
     "EP_EXPERIMENTAL_STREAMING_LAYER": "1",
+    # NCCL Device API windows require the cuMem allocator. SGLang otherwise
+    # disables it unless its separate symmetric-memory feature is selected.
+    "NCCL_CUMEM_ENABLE": "1",
+    # PyTorch communicators are not guaranteed to be created with the NCCL
+    # Device API symmetric-memory capability required by ElasticBuffer.
+    # Create and cache one DeepEP-managed communicator for the EP group.
+    "EP_REUSE_NCCL_COMM": "0",
 }
 _DEEPEP_STREAMING_INCOMPATIBLE_ENV = (
     "EP_EXPERIMENTAL_STREAMING_COPY_SHADOW",
