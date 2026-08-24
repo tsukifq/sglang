@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.deepep_streaming import (
     is_deepep_streaming_enabled,
     launch_bf16_streaming_moe,
+    launch_fp8_streaming_moe,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
@@ -373,6 +374,7 @@ class FusedMoE(torch.nn.Module):
         self._deepep_streaming_streams = None
         self._deepep_streaming_drain_stream = None
         self._deepep_streaming_inflight = None
+        self._deepep_streaming_fp8 = False
         if getattr(self.dispatcher, "streaming_enabled", False):
             self._validate_deepep_streaming()
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
@@ -434,13 +436,35 @@ class FusedMoE(torch.nn.Module):
             unsupported.append("EP8 with MoE TP1")
         if not self.use_deep_gemm:
             unsupported.append("--moe-runner-backend deep_gemm")
-        if self.quant_config is not None:
-            unsupported.append("unquantized BF16 experts")
-        if (
-            self.w13_weight.dtype != torch.bfloat16
-            or self.w2_weight.dtype != torch.bfloat16
-        ):
-            unsupported.append("BF16 W13/W2 weights")
+        if self.quant_config is None:
+            if (
+                self.w13_weight.dtype != torch.bfloat16
+                or self.w2_weight.dtype != torch.bfloat16
+            ):
+                unsupported.append("BF16 W13/W2 weights")
+        elif isinstance(self.quant_method, Fp8MoEMethod):
+            self._deepep_streaming_fp8 = True
+            if (
+                not self.quant_method.block_quant
+                or tuple(self.quant_method.weight_block_size or ()) != (128, 128)
+                or self.quant_method.use_mxfp8
+                or self.quant_method.is_fp4_expert
+            ):
+                unsupported.append("dynamic block-FP8 [128, 128] experts")
+            if (
+                self.w13_weight.dtype != torch.float8_e4m3fn
+                or self.w2_weight.dtype != torch.float8_e4m3fn
+            ):
+                unsupported.append("e4m3 W13/W2 weights")
+            if (
+                self.w13_weight_scale_inv.dtype != torch.float32
+                or self.w2_weight_scale_inv.dtype != torch.float32
+            ):
+                unsupported.append("float32 block-FP8 weight scales")
+            if self.quant_method.quant_config.activation_scheme != "dynamic":
+                unsupported.append("dynamic FP8 activation scaling")
+        else:
+            unsupported.append("BF16 or block-FP8 expert quantization")
         if self.num_fused_shared_experts != 0:
             unsupported.append("shared-expert fusion disabled")
         if self.reduce_results:
@@ -486,13 +510,25 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
-        result = launch_bf16_streaming_moe(
-            dispatch,
-            self.w13_weight,
-            self.w2_weight,
-            streams=self._deepep_streaming_streams,
-            drain_stream=self._deepep_streaming_drain_stream,
-        )
+        if self._deepep_streaming_fp8:
+            result = launch_fp8_streaming_moe(
+                dispatch,
+                self.w13_weight,
+                self.w2_weight,
+                self.w13_weight_scale_inv,
+                self.w2_weight_scale_inv,
+                self.quant_method.weight_block_size,
+                streams=self._deepep_streaming_streams,
+                drain_stream=self._deepep_streaming_drain_stream,
+            )
+        else:
+            result = launch_bf16_streaming_moe(
+                dispatch,
+                self.w13_weight,
+                self.w2_weight,
+                streams=self._deepep_streaming_streams,
+                drain_stream=self._deepep_streaming_drain_stream,
+            )
         # Retain events, transport handle, and sidecar tensors until this layer's
         # next invocation. DeepEP separately gates epoch reuse on the drain event.
         self._deepep_streaming_inflight = result

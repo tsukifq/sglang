@@ -346,6 +346,7 @@ class DeepEPStreamingBuffer:
         hidden_size: int,
         router_topk: int,
         num_max_tokens_per_rank: int,
+        use_fp8_dispatch: bool,
     ):
         if ElasticBuffer is None:
             raise RuntimeError(
@@ -357,13 +358,14 @@ class DeepEPStreamingBuffer:
             hidden_size,
             router_topk,
             num_max_tokens_per_rank,
+            use_fp8_dispatch,
         )
         state = cls._state()
         if state.buffer is not None:
             if state.signature != signature:
                 raise RuntimeError(
                     "all streaming MoE layers must share EP size, hidden size, "
-                    "top-k, and token capacity"
+                    "top-k, token capacity, and dispatch dtype"
                 )
             return state.buffer
 
@@ -373,7 +375,7 @@ class DeepEPStreamingBuffer:
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden_size,
             num_topk=router_topk,
-            use_fp8_dispatch=False,
+            use_fp8_dispatch=use_fp8_dispatch,
             allow_hybrid_mode=False,
             allow_multiple_reduction=False,
             prefer_overlap_with_compute=True,
@@ -629,11 +631,25 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
         topk_weights = topk_output.topk_weights.contiguous()
         hidden_states = hidden_states.contiguous()
+        dispatch_payload = hidden_states
+        if self.use_fp8:
+            use_tma_aligned_scales = (
+                deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+            dispatch_payload = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                128,
+                column_major_scales=use_tma_aligned_scales,
+                scale_tma_aligned=use_tma_aligned_scales,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
         buffer = DeepEPStreamingBuffer.get_buffer(
             self.group,
             self.hidden_size,
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
+            self.use_fp8,
         )
         previous_event = ElasticBuffer.capture()
         (
@@ -643,7 +659,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             transport_handle,
             transport_event,
         ) = buffer.dispatch(
-            hidden_states,
+            dispatch_payload,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_experts=self.num_experts,
@@ -656,6 +672,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             do_cpu_sync=False,
             do_expand=True,
             do_zero_padding=False,
+            use_tma_aligned_col_major_sf=self.use_fp8 and use_tma_aligned_scales,
         )
         return DeepEPStreamingDispatch.from_runtime(
             buffer=buffer,

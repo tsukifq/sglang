@@ -5,8 +5,9 @@ import pytest
 
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
+    _launch_streaming_moe_lanes,
     configure_deepep_streaming_environment,
-    launch_bf16_streaming_moe,
+    launch_fp8_streaming_moe,
 )
 
 
@@ -60,9 +61,18 @@ def test_streaming_dispatch_rejects_incomplete_runtime_view():
 
 
 def test_streaming_layer_keeps_dependencies_on_device():
-    source = inspect.getsource(launch_bf16_streaming_moe)
+    source = inspect.getsource(_launch_streaming_moe_lanes)
     assert "cuStreamWaitValue64" in source
     assert "streaming_combine_return" in source
     assert "streaming_combine_reduce" in source
     assert ".synchronize(" not in source
     assert ".barrier(" not in source
+
+
+def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
+    source = inspect.getsource(launch_fp8_streaming_moe)
+    assert source.count("m_grouped_fp8_gemm_nt_contiguous") == 2
+    assert source.count("use_psum_layout=True") == 2
+    assert "fuse_silu_and_mul=True" in source
+    assert "m_indices" not in source
+    assert "shadow" in source

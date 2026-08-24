@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
@@ -1200,10 +1202,34 @@ class TestDeepEPStreamingArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "deepep-mode normal"):
                 server_args._handle_a2a_moe()
 
-    def test_streaming_rejects_fp8_checkpoint(self):
+    def test_streaming_accepts_verified_block_fp8_checkpoint(self):
+        hf_config = SimpleNamespace(
+            quantization_config={
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+            },
+            num_experts_per_tok=8,
+            n_routed_experts=256,
+        )
+        model_config = SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+            dtype=torch.bfloat16,
+        )
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args()
+            server_args.model_path = "/model/dsv3-fp8"
+            with patch.object(
+                server_args, "get_model_config", return_value=model_config
+            ):
+                server_args._handle_a2a_moe()
+            self.assertTrue(server_args.enable_deepep_streaming)
+
+    def test_streaming_rejects_unverified_fp8_override(self):
         with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
             server_args = self._args(quantization="fp8")
-            with self.assertRaisesRegex(ValueError, "FP8 streaming runner"):
+            with self.assertRaisesRegex(ValueError, "serialized dynamic block-FP8"):
                 server_args._handle_a2a_moe()
 
     def test_streaming_rejects_non_ep8_topology(self):

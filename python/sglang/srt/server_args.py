@@ -1971,7 +1971,7 @@ class ServerArgs:
         bool,
         "Enable the experimental inference-only lane-streaming DeepEP path. "
         "The current milestone requires NVIDIA CUDA, TP8 with DP attention "
-        "and DP8, EP8/MoE-TP1, unquantized BF16 experts, DeepGEMM, and "
+        "and DP8, EP8/MoE-TP1, BF16 or block-FP8 experts, DeepGEMM, and "
         "DeepEP normal mode. CUDA graphs and shared-expert fusion are "
         "disabled automatically.",
     ] = False
@@ -5878,11 +5878,15 @@ class ServerArgs:
             )
 
         model_quantization = None
+        checkpoint_quant_config = None
         if self.model_path.lower() not in ("none", "dummy"):
             import torch
 
             model_config = self.get_model_config()
             model_quantization = get_quantization_config(model_config.hf_config)
+            checkpoint_quant_config = getattr(
+                model_config.hf_config, "quantization_config", None
+            )
             if model_config.dtype != torch.bfloat16:
                 raise ValueError(
                     "--enable-deepep-streaming currently requires BF16 model "
@@ -5895,6 +5899,9 @@ class ServerArgs:
                 and text_config is not model_config.hf_config
             ):
                 model_quantization = get_quantization_config(text_config)
+                checkpoint_quant_config = getattr(
+                    text_config, "quantization_config", None
+                )
             router_topk = getattr(text_config, "num_experts_per_tok", None)
             num_experts = getattr(text_config, "n_routed_experts", None)
             if num_experts is None:
@@ -5908,13 +5915,24 @@ class ServerArgs:
                     "--enable-deepep-streaming requires equal experts per EP rank"
                 )
 
-        if view.quantization is not None or model_quantization is not None:
-            quantization = view.quantization or model_quantization
-            raise ValueError(
-                "--enable-deepep-streaming currently supports only unquantized "
-                f"BF16 experts; checkpoint quantization is {quantization!r}. "
-                "The FP8 streaming runner is not implemented yet."
-            )
+        quantization = view.quantization or model_quantization
+        if quantization is not None:
+            if quantization != "fp8":
+                raise ValueError(
+                    "--enable-deepep-streaming supports only BF16 or FP8 "
+                    f"experts; checkpoint quantization is {quantization!r}"
+                )
+            if (
+                not isinstance(checkpoint_quant_config, dict)
+                or checkpoint_quant_config.get("quant_method") != "fp8"
+                or checkpoint_quant_config.get("activation_scheme") != "dynamic"
+                or checkpoint_quant_config.get("weight_block_size") != [128, 128]
+            ):
+                raise ValueError(
+                    "--enable-deepep-streaming FP8 requires a serialized "
+                    "dynamic block-FP8 checkpoint with weight_block_size "
+                    "[128, 128]"
+                )
 
         overrides = {"disable_shared_experts_fusion": True}
         if view.moe_runner_backend == "auto":
@@ -5927,7 +5945,7 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DEEPEP_STREAMING.set(True)
         logger.warning(
             "Experimental lane-streaming DeepEP is enabled: normal mode, "
-            "DeepGEMM, EP8/MoE-TP1, and BF16 experts. CUDA graphs and "
+            "DeepGEMM, EP8/MoE-TP1, and BF16/block-FP8 experts. CUDA graphs and "
             "shared-expert fusion are disabled."
         )
 
