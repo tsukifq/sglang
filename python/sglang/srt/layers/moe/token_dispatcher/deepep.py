@@ -38,6 +38,7 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+ElasticBuffer = None
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -48,6 +49,13 @@ try:
         from zbal.zbal_buffer import Buffer
     else:
         from deep_ep import Buffer, Config
+
+        try:
+            from deep_ep import ElasticBuffer
+        except ImportError:
+            # The regular DeepEP path remains usable with releases that predate
+            # ElasticBuffer. The streaming feature validates this separately.
+            pass
 
     if not _is_npu:
         from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -315,6 +323,64 @@ class DeepEPBuffer:
             raise Exception("unsupported mode")
 
 
+class DeepEPStreamingBuffer:
+    """Process-wide ElasticBuffer used only by the experimental EP8 path."""
+
+    @classmethod
+    def _state(cls):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        state = buffers.get("deepep_streaming_ep_state")
+        if state is None:
+            state = SimpleNamespace(buffer=None, signature=None)
+            buffers["deepep_streaming_ep_state"] = state
+        return state
+
+    @classmethod
+    def get_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        router_topk: int,
+        num_max_tokens_per_rank: int,
+    ):
+        if ElasticBuffer is None:
+            raise RuntimeError(
+                "SGLANG_ENABLE_DEEPEP_STREAMING requires the Async MoE DeepEP "
+                "fork with ElasticBuffer streaming APIs"
+            )
+        signature = (
+            group.size(),
+            hidden_size,
+            router_topk,
+            num_max_tokens_per_rank,
+        )
+        state = cls._state()
+        if state.buffer is not None:
+            if state.signature != signature:
+                raise RuntimeError(
+                    "all streaming MoE layers must share EP size, hidden size, "
+                    "top-k, and token capacity"
+                )
+            return state.buffer
+
+        state.signature = signature
+        state.buffer = ElasticBuffer(
+            group,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=router_topk,
+            use_fp8_dispatch=False,
+            allow_hybrid_mode=False,
+            allow_multiple_reduction=False,
+            prefer_overlap_with_compute=True,
+        )
+        return state.buffer
+
+
 class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
@@ -540,6 +606,63 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+        )
+
+    def dispatch_streaming(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        """Submit ElasticBuffer dispatch and export its lane-local sidecar."""
+
+        from sglang.srt.layers.moe.deepep_streaming import DeepEPStreamingDispatch
+
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("streaming DeepEP dispatch requires BF16 hidden states")
+        if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            raise ValueError(
+                "streaming DeepEP token count exceeds "
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+                f"{hidden_states.shape[0]} > {self.num_max_dispatch_tokens_per_rank}"
+            )
+
+        topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
+        topk_weights = topk_output.topk_weights.contiguous()
+        hidden_states = hidden_states.contiguous()
+        buffer = DeepEPStreamingBuffer.get_buffer(
+            self.group,
+            self.hidden_size,
+            self.router_topk,
+            self.num_max_dispatch_tokens_per_rank,
+        )
+        previous_event = ElasticBuffer.capture()
+        (
+            _recv_x,
+            _recv_topk_ids,
+            _recv_topk_weights,
+            transport_handle,
+            transport_event,
+        ) = buffer.dispatch(
+            hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=self.num_experts,
+            num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            expert_alignment=128,
+            previous_event=previous_event,
+            async_with_compute_stream=True,
+            allocate_on_comm_stream=True,
+            do_handle_copy=True,
+            do_cpu_sync=False,
+            do_expand=True,
+            do_zero_padding=False,
+        )
+        return DeepEPStreamingDispatch.from_runtime(
+            buffer=buffer,
+            raw=buffer.get_streaming_lane_view(),
+            source_topk_idx=topk_ids,
+            transport_handle=transport_handle,
+            transport_event=transport_event,
         )
 
     def _dispatch_core(
@@ -877,6 +1000,35 @@ class DeepEPDispatcher(BaseDispatcher):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+        from sglang.srt.layers.moe.deepep_streaming import (
+            configure_deepep_streaming_environment,
+            is_deepep_streaming_enabled,
+        )
+
+        self.streaming_enabled = is_deepep_streaming_enabled()
+        if self.streaming_enabled:
+            configure_deepep_streaming_environment()
+            if _is_npu or is_hip():
+                raise ValueError("streaming DeepEP currently supports NVIDIA CUDA only")
+            if ElasticBuffer is None:
+                raise RuntimeError(
+                    "streaming DeepEP requires the Async MoE DeepEP fork"
+                )
+            if deepep_mode != DeepEPMode.NORMAL:
+                raise ValueError(
+                    "streaming DeepEP requires --deepep-mode normal; auto resolves "
+                    "decode to the incompatible low-latency transport"
+                )
+            if is_tbo_enabled():
+                raise ValueError("streaming DeepEP does not support two-batch overlap")
+            if group.size() != 8:
+                raise ValueError("streaming DeepEP is currently restricted to EP8")
+            if router_topk < group.size():
+                raise ValueError("streaming DeepEP requires top-k >= EP size")
+            if num_experts % group.size() != 0:
+                raise ValueError("streaming DeepEP requires equal experts per EP rank")
+            if params_dtype != torch.bfloat16:
+                raise ValueError("streaming DeepEP currently requires BF16 parameters")
 
         common_kwargs = dict(
             group=group,
@@ -921,11 +1073,27 @@ class DeepEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> DispatchOutput:
+        if self.streaming_enabled:
+            raise RuntimeError(
+                "streaming DeepEP must use dispatch_streaming() and the fused "
+                "source-local combine path"
+            )
         self.dispatch_a(hidden_states, topk_output)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
         return ret
+
+    def dispatch_streaming(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        if not self.streaming_enabled:
+            raise RuntimeError("streaming DeepEP is not enabled")
+        if self._stage != _Stage.INITIAL:
+            raise RuntimeError("streaming dispatch cannot overlap dispatcher stages")
+        return self._normal_dispatcher.dispatch_streaming(hidden_states, topk_output)
 
     def dispatch_a(
         self,

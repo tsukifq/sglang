@@ -180,6 +180,9 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
 
+        if getattr(self.dispatcher, "streaming_enabled", False):
+            return super().forward_impl(hidden_states, topk_output)
+
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,

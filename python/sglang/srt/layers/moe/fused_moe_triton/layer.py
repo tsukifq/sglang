@@ -29,6 +29,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.deepep_streaming import (
+    is_deepep_streaming_enabled,
+    launch_bf16_streaming_moe,
+)
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
@@ -38,6 +42,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -103,6 +108,10 @@ def _get_deepep_comm_group(a2a_backend):
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
+    if is_deepep_streaming_enabled() and not a2a_backend.is_deepep():
+        raise ValueError(
+            "SGLANG_ENABLE_DEEPEP_STREAMING requires --moe-a2a-backend deepep"
+        )
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
@@ -120,7 +129,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
-        return MaybeTboDeepEPDispatcher(
+        dispatcher_kwargs = dict(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -131,6 +140,11 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+        )
+        if is_deepep_streaming_enabled():
+            return DeepEPDispatcher(**dispatcher_kwargs)
+        return MaybeTboDeepEPDispatcher(
+            **dispatcher_kwargs,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -356,6 +370,11 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self._deepep_streaming_streams = None
+        self._deepep_streaming_drain_stream = None
+        self._deepep_streaming_inflight = None
+        if getattr(self.dispatcher, "streaming_enabled", False):
+            self._validate_deepep_streaming()
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
@@ -406,6 +425,78 @@ class FusedMoE(torch.nn.Module):
         )
 
         return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+
+    def _validate_deepep_streaming(self) -> None:
+        """Fail closed for model shapes not covered by the EP8 milestone."""
+
+        unsupported = []
+        if self.moe_ep_size != 8 or self.moe_tp_size != 1:
+            unsupported.append("EP8 with MoE TP1")
+        if not self.use_deep_gemm:
+            unsupported.append("--moe-runner-backend deep_gemm")
+        if self.quant_config is not None:
+            unsupported.append("unquantized BF16 experts")
+        if (
+            self.w13_weight.dtype != torch.bfloat16
+            or self.w2_weight.dtype != torch.bfloat16
+        ):
+            unsupported.append("BF16 W13/W2 weights")
+        if self.num_fused_shared_experts != 0:
+            unsupported.append("shared-expert fusion disabled")
+        if self.reduce_results:
+            unsupported.append("reduce_results=False")
+        if self.with_bias:
+            unsupported.append("bias-free experts")
+        if self.moe_runner_config.no_combine:
+            unsupported.append("no_combine=False")
+        if (
+            not self.moe_runner_config.is_gated
+            or self.moe_runner_config.activation != "silu"
+        ):
+            unsupported.append("gated SiLU experts")
+        if any(
+            value is not None
+            for value in (
+                self.moe_runner_config.swiglu_limit,
+                self.moe_runner_config.gemm1_alpha,
+                self.moe_runner_config.gemm1_clamp_limit,
+            )
+        ):
+            unsupported.append("unclamped standard SwiGLU")
+        if unsupported:
+            raise ValueError(
+                "SGLANG_ENABLE_DEEPEP_STREAMING currently requires: "
+                + ", ".join(unsupported)
+            )
+
+    def _forward_deepep_streaming(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> torch.Tensor:
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise ValueError("streaming DeepEP requires standard top-k output")
+        if torch.is_grad_enabled():
+            raise RuntimeError("streaming DeepEP is inference-only")
+        if self._deepep_streaming_streams is None:
+            self._deepep_streaming_streams = tuple(
+                torch.cuda.Stream(priority=0) for _ in range(self.moe_ep_size)
+            )
+            self._deepep_streaming_drain_stream = torch.cuda.Stream(priority=0)
+
+        dispatch = self.dispatcher.dispatch_streaming(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        result = launch_bf16_streaming_moe(
+            dispatch,
+            self.w13_weight,
+            self.w2_weight,
+            streams=self._deepep_streaming_streams,
+            drain_stream=self._deepep_streaming_drain_stream,
+        )
+        # Retain events, transport handle, and sidecar tensors until this layer's
+        # next invocation. DeepEP separately gates epoch reuse on the drain event.
+        self._deepep_streaming_inflight = result
+        return result.output
 
     def _load_per_tensor_weight_scale(
         self,
@@ -1247,6 +1338,11 @@ class FusedMoE(torch.nn.Module):
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if (
+            getattr(self.dispatcher, "streaming_enabled", False)
+            and is_in_tc_piecewise_cuda_graph()
+        ):
+            raise RuntimeError("streaming DeepEP does not support CUDA graph capture")
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1277,6 +1373,12 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+
+        if getattr(self.dispatcher, "streaming_enabled", False):
+            final_hidden_states = self._forward_deepep_streaming(
+                hidden_states, topk_output
+            )
+            return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
