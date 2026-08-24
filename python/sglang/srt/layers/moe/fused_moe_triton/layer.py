@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import json
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -375,6 +377,7 @@ class FusedMoE(torch.nn.Module):
         self._deepep_streaming_drain_stream = None
         self._deepep_streaming_inflight = None
         self._deepep_streaming_fp8 = False
+        self._deepep_timeline_calls = 0
         if getattr(self.dispatcher, "streaming_enabled", False):
             self._validate_deepep_streaming()
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
@@ -493,8 +496,121 @@ class FusedMoE(torch.nn.Module):
                 + ", ".join(unsupported)
             )
 
+    def _deepep_timeline_context(self, mode: str) -> Optional[dict]:
+        """Select one DeepEP layer invocation for an intrusive GPU timeline."""
+
+        call_index = self._deepep_timeline_calls
+        self._deepep_timeline_calls += 1
+        enabled = os.getenv("SGLANG_DEEPEP_TIMELINE", "0").lower()
+        if enabled in ("", "0", "false", "no", "n"):
+            return None
+        if not get_moe_a2a_backend().is_deepep():
+            return None
+        try:
+            target_layer = int(os.getenv("SGLANG_DEEPEP_TIMELINE_LAYER", "0"))
+            target_call = int(os.getenv("SGLANG_DEEPEP_TIMELINE_CALL", "0"))
+        except ValueError as error:
+            raise ValueError(
+                "SGLANG_DEEPEP_TIMELINE_LAYER and _CALL must be integers"
+            ) from error
+        if self.layer_id != target_layer or call_index != target_call:
+            return None
+        return {
+            "rank": self.moe_ep_rank,
+            "layer_id": self.layer_id,
+            "call_index": call_index,
+            "mode": mode,
+        }
+
+    def _baseline_logical_outbound_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> list[dict]:
+        """Count source payload bytes, excluding DeepEP protocol traffic."""
+
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            return []
+        topk_ids = topk_output.topk_ids
+        hidden_bytes = hidden_states.size(1) * hidden_states.element_size()
+        route_metadata_bytes = topk_ids.size(1) * (
+            torch.tensor([], dtype=torch.int64).element_size()
+            + topk_output.topk_weights.element_size()
+        )
+        destinations = []
+        for destination in range(self.moe_ep_size):
+            lower = destination * self.num_local_experts
+            upper = lower + self.num_local_experts
+            routed = (topk_ids >= lower) & (topk_ids < upper)
+            unique_tokens = int(routed.any(dim=1).sum().item())
+            routes = int(routed.sum().item())
+            destinations.append(
+                {
+                    "destination_rank": destination,
+                    "unique_tokens": unique_tokens,
+                    "routes": routes,
+                    "logical_payload_bytes": unique_tokens
+                    * (hidden_bytes + route_metadata_bytes),
+                }
+            )
+        return destinations
+
+    def _emit_baseline_timeline(
+        self,
+        context: dict,
+        origin: torch.cuda.Event,
+        dispatch_done: torch.cuda.Event,
+        gemm_done: torch.cuda.Event,
+        combine_done: torch.cuda.Event,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        dispatch_output: DispatchOutput,
+        dispatch_buffer_rows: int,
+    ) -> None:
+        """Synchronize and print one explicitly requested baseline sample."""
+
+        combine_done.synchronize()
+        outbound = self._baseline_logical_outbound_dispatch(
+            hidden_states, topk_output
+        )
+        dispatch_ms = origin.elapsed_time(dispatch_done)
+        logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+        runner_rows = list(dispatch_output.num_recv_tokens_per_expert)
+        payload = {
+            "schema": "sglang-deepep-baseline-timeline-v2",
+            **context,
+            "input_tokens": hidden_states.size(0),
+            "dispatch": {
+                "done_ms": dispatch_ms,
+                "elapsed_ms": dispatch_ms,
+                "logical_outbound_payload_bytes": logical_bytes,
+                "logical_outbound_gbps": logical_bytes / (dispatch_ms * 1e6),
+                "destinations": outbound,
+                "received_buffer_rows_before_runner": dispatch_buffer_rows,
+                "runner_rows": sum(runner_rows),
+                "runner_nonempty_experts": sum(row > 0 for row in runner_rows),
+                "runner_max_expert_rows": max(runner_rows, default=0),
+                "runner_rows_per_expert": runner_rows,
+            },
+            "grouped_mlp": {
+                "start_ms": origin.elapsed_time(dispatch_done),
+                "done_ms": origin.elapsed_time(gemm_done),
+                "elapsed_ms": dispatch_done.elapsed_time(gemm_done),
+            },
+            "combine": {
+                "start_ms": origin.elapsed_time(gemm_done),
+                "done_ms": origin.elapsed_time(combine_done),
+                "elapsed_ms": gemm_done.elapsed_time(combine_done),
+            },
+            "total_ms": origin.elapsed_time(combine_done),
+        }
+        print("DEEPEP_BASELINE_TIMELINE " + json.dumps(payload), flush=True)
+
     def _forward_deepep_streaming(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        timeline_context: Optional[dict] = None,
     ) -> torch.Tensor:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError("streaming DeepEP requires standard top-k output")
@@ -505,6 +621,11 @@ class FusedMoE(torch.nn.Module):
                 torch.cuda.Stream(priority=0) for _ in range(self.moe_ep_size)
             )
             self._deepep_streaming_drain_stream = torch.cuda.Stream(priority=0)
+
+        timeline_origin = None
+        if timeline_context is not None:
+            timeline_origin = torch.cuda.Event(enable_timing=True)
+            timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
 
         dispatch = self.dispatcher.dispatch_streaming(
             hidden_states=hidden_states,
@@ -520,6 +641,8 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method.weight_block_size,
                 streams=self._deepep_streaming_streams,
                 drain_stream=self._deepep_streaming_drain_stream,
+                timeline_context=timeline_context,
+                timeline_origin=timeline_origin,
             )
         else:
             result = launch_bf16_streaming_moe(
@@ -528,6 +651,8 @@ class FusedMoE(torch.nn.Module):
                 self.w2_weight,
                 streams=self._deepep_streaming_streams,
                 drain_stream=self._deepep_streaming_drain_stream,
+                timeline_context=timeline_context,
+                timeline_origin=timeline_origin,
             )
         # Retain events, transport handle, and sidecar tensors until this layer's
         # next invocation. DeepEP separately gates epoch reuse on the drain event.
@@ -1411,28 +1536,61 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         if getattr(self.dispatcher, "streaming_enabled", False):
+            timeline_context = self._deepep_timeline_context("streaming")
             final_hidden_states = self._forward_deepep_streaming(
-                hidden_states, topk_output
+                hidden_states, topk_output, timeline_context
             )
             return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
+
+        timeline_context = self._deepep_timeline_context("baseline")
+        timeline_origin = None
+        dispatch_done = None
+        gemm_done = None
+        combine_done = None
+        if timeline_context is not None:
+            timeline_origin = torch.cuda.Event(enable_timing=True)
+            dispatch_done = torch.cuda.Event(enable_timing=True)
+            gemm_done = torch.cuda.Event(enable_timing=True)
+            combine_done = torch.cuda.Event(enable_timing=True)
+            timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        dispatch_buffer_rows = dispatch_output.hidden_states.size(0)
+        if dispatch_done is not None:
+            dispatch_done.record(torch.cuda.current_stream(hidden_states.device))
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
+        if gemm_done is not None:
+            gemm_done.record(torch.cuda.current_stream(hidden_states.device))
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            if combine_done is not None:
+                combine_done.record(torch.cuda.current_stream(hidden_states.device))
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
+
+        if timeline_context is not None:
+            self._emit_baseline_timeline(
+                timeline_context,
+                timeline_origin,
+                dispatch_done,
+                gemm_done,
+                combine_done,
+                hidden_states,
+                topk_output,
+                dispatch_output,
+                dispatch_buffer_rows,
+            )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

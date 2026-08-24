@@ -9,6 +9,7 @@ kernels.  The regular DeepEP path remains the default.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
@@ -171,6 +172,134 @@ def _check_cuda_driver(result: tuple[Any, ...], operation: str, cuda: Any) -> No
         raise RuntimeError(f"{operation} failed: {result}")
 
 
+def _lane_layout_from_psum(psum: Sequence[int]) -> dict[str, Any]:
+    """Decode useful expert rows and alignment holes from DeepGEMM psums."""
+
+    starts = []
+    counts = []
+    previous_end = 0
+    for end in psum:
+        start = (previous_end + 127) // 128 * 128
+        starts.append(start)
+        counts.append(end - start)
+        previous_end = end
+    useful_rows = sum(counts)
+    active_span_rows = psum[-1] if psum else 0
+    return {
+        "useful_rows": useful_rows,
+        "active_span_rows": active_span_rows,
+        "alignment_hole_rows": active_span_rows - useful_rows,
+        "nonempty_experts": sum(count > 0 for count in counts),
+        "max_expert_rows": max(counts, default=0),
+        "expert_rows": counts,
+        "expert_starts": starts,
+    }
+
+
+def _logical_outbound_dispatch(
+    dispatch: DeepEPStreamingDispatch,
+) -> list[dict[str, int]]:
+    """Count routed payload bytes without claiming physical link traffic.
+
+    DeepEP sends one activation to a destination when any of the token's
+    routes lands there, plus the token's complete top-k ids and weights. The
+    count excludes protocol headers, count matrices, and cache-line traffic.
+    """
+
+    topk_idx = dispatch.source_topk_idx
+    lanes = dispatch.x.size(0)
+    local_experts = dispatch.expert_psum.size(1)
+    hidden_bytes = dispatch.x.size(2) * dispatch.x.element_size()
+    route_metadata_bytes = topk_idx.size(1) * (
+        topk_idx.element_size() + torch.tensor([], dtype=torch.float32).element_size()
+    )
+    destinations = []
+    for destination in range(lanes):
+        lower = destination * local_experts
+        upper = lower + local_experts
+        routed = (topk_idx >= lower) & (topk_idx < upper)
+        unique_tokens = int(routed.any(dim=1).sum().item())
+        routes = int(routed.sum().item())
+        destinations.append(
+            {
+                "destination_rank": destination,
+                "unique_tokens": unique_tokens,
+                "routes": routes,
+                "logical_payload_bytes": unique_tokens
+                * (hidden_bytes + route_metadata_bytes),
+            }
+        )
+    return destinations
+
+
+def _emit_streaming_timeline(
+    dispatch: DeepEPStreamingDispatch,
+    context: dict[str, Any],
+    origin: torch.cuda.Event,
+    dispatch_done: torch.cuda.Event,
+    lane_events: Sequence[dict[str, torch.cuda.Event]],
+    reduce_start: torch.cuda.Event,
+    reduce_done: torch.cuda.Event,
+) -> None:
+    """Synchronize and print one explicitly requested diagnostic sample."""
+
+    reduce_done.synchronize()
+    dispatch_done.synchronize()
+    for events in lane_events:
+        events["return_done"].synchronize()
+    psums = dispatch.expert_psum.to(device="cpu", dtype=torch.int64).tolist()
+    outbound = _logical_outbound_dispatch(dispatch)
+    dispatch_ms = origin.elapsed_time(dispatch_done)
+    total_logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+    lanes = []
+    for source_rank, (events, psum) in enumerate(zip(lane_events, psums)):
+        ready_ms = origin.elapsed_time(events["gemm_start"])
+        gemm_done_ms = origin.elapsed_time(events["gemm_done"])
+        return_start_ms = origin.elapsed_time(events["return_start"])
+        return_done_ms = origin.elapsed_time(events["return_done"])
+        lanes.append(
+            {
+                "source_rank": source_rank,
+                **_lane_layout_from_psum(psum),
+                "gemm_start_ms": ready_ms,
+                "gemm_done_ms": gemm_done_ms,
+                "gemm_ms": events["gemm_start"].elapsed_time(events["gemm_done"]),
+                "return_start_ms": return_start_ms,
+                "return_done_ms": return_done_ms,
+                "return_ms": events["return_start"].elapsed_time(
+                    events["return_done"]
+                ),
+            }
+        )
+    payload = {
+        "schema": "sglang-deepep-streaming-timeline-v2",
+        **context,
+        "generation": dispatch.generation,
+        "input_tokens": dispatch.source_topk_idx.size(0),
+        "lane_capacity_rows": dispatch.x.size(1),
+        "dispatch": {
+            "transport_event_done_ms": dispatch_ms,
+            "logical_outbound_payload_bytes": total_logical_bytes,
+            "logical_outbound_gbps_at_transport_event": total_logical_bytes
+            / (dispatch_ms * 1e6),
+            "first_lane_consumer_visible_ms": min(
+                lane["gemm_start_ms"] for lane in lanes
+            ),
+            "all_lanes_consumer_visible_ms": max(
+                lane["gemm_start_ms"] for lane in lanes
+            ),
+            "destinations": outbound,
+        },
+        "lanes": lanes,
+        "combine_reduce": {
+            "start_ms": origin.elapsed_time(reduce_start),
+            "done_ms": origin.elapsed_time(reduce_done),
+            "elapsed_ms_including_return_wait": reduce_start.elapsed_time(reduce_done),
+        },
+    }
+    print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
+
+
 def _launch_streaming_moe_lanes(
     dispatch: DeepEPStreamingDispatch,
     lane_compute: Callable[[int, torch.Tensor], Sequence[torch.Tensor]],
@@ -178,6 +307,8 @@ def _launch_streaming_moe_lanes(
     *,
     streams: Sequence[torch.cuda.Stream] | None,
     drain_stream: torch.cuda.Stream | None,
+    timeline_context: dict[str, Any] | None,
+    timeline_origin: torch.cuda.Event | None,
 ) -> DeepEPStreamingLayerResult:
     """Submit one expert runner per ready source lane and return asynchronously."""
 
@@ -207,6 +338,17 @@ def _launch_streaming_moe_lanes(
         dispatch.expert_psum,
         dispatch.pack_done_seq,
     )
+    timeline_enabled = timeline_context is not None
+    if timeline_enabled != (timeline_origin is not None):
+        raise ValueError("timeline context and origin must be provided together")
+    lane_timeline: list[dict[str, torch.cuda.Event]] = []
+    dispatch_done = None
+    if timeline_enabled:
+        profile_stream = torch.cuda.Stream(priority=0)
+        dispatch_done = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(profile_stream):
+            dispatch.transport_event.current_stream_wait()
+            dispatch_done.record(profile_stream)
 
     for lane, stream in enumerate(streams):
         _check_cuda_driver(
@@ -225,14 +367,41 @@ def _launch_streaming_moe_lanes(
             0, lane * metadata_capacity, metadata_capacity
         )
         with torch.cuda.stream(stream):
+            gemm_start = (
+                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+            )
+            gemm_done = (
+                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+            )
+            return_start = (
+                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+            )
+            return_done = (
+                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+            )
+            if gemm_start is not None:
+                gemm_start.record(stream)
             transient_tensors = lane_compute(lane, lane_output[lane])
+            if gemm_done is not None:
+                gemm_done.record(stream)
             lane_output[lane].mul_(dispatch.route_weights[lane].unsqueeze(1))
+            if return_start is not None:
+                return_start.record(stream)
             dispatch.buffer.streaming_combine_return(
                 lane_output[lane], metadata, lane, dispatch.generation
             )
-            done = torch.cuda.Event()
+            done = return_done or torch.cuda.Event()
             done.record(stream)
             returned.append(done)
+            if timeline_enabled:
+                lane_timeline.append(
+                    {
+                        "gemm_start": gemm_start,
+                        "gemm_done": gemm_done,
+                        "return_start": return_start,
+                        "return_done": return_done,
+                    }
+                )
 
         for tensor in (
             *dispatch_tensors,
@@ -247,15 +416,34 @@ def _launch_streaming_moe_lanes(
     # Keeping it on the serving stream makes the next operation's dependency
     # ordinary CUDA stream order rather than an inter-rank synchronization.
     source_stream = torch.cuda.current_stream(dispatch.x.device)
+    reduce_start = (
+        torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+    )
+    reduce_done = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+    if reduce_start is not None:
+        reduce_start.record(source_stream)
     combined_x, source_ready = dispatch.buffer.streaming_combine_reduce(
         dispatch.source_topk_idx, dispatch.generation
     )
+    if reduce_done is not None:
+        reduce_done.record(source_stream)
     with torch.cuda.stream(drain_stream):
         for done in returned:
             drain_stream.wait_event(done)
         dispatch.buffer.release_streaming_lane_view()
         epoch_drained = torch.cuda.Event()
         epoch_drained.record(drain_stream)
+
+    if timeline_enabled:
+        _emit_streaming_timeline(
+            dispatch,
+            timeline_context,
+            timeline_origin,
+            dispatch_done,
+            lane_timeline,
+            reduce_start,
+            reduce_done,
+        )
 
     return DeepEPStreamingLayerResult(
         output=combined_x,
@@ -274,6 +462,8 @@ def launch_bf16_streaming_moe(
     *,
     streams: Sequence[torch.cuda.Stream] | None = None,
     drain_stream: torch.cuda.Stream | None = None,
+    timeline_context: dict[str, Any] | None = None,
+    timeline_origin: torch.cuda.Event | None = None,
 ) -> DeepEPStreamingLayerResult:
     """Run W13, SwiGLU, W2, weighted return, and source-local combine.
 
@@ -286,7 +476,11 @@ def launch_bf16_streaming_moe(
     from sglang.jit_kernel.activation import silu_and_mul
 
     if dispatch.x.dtype != torch.bfloat16:
-        raise ValueError("streaming dispatch currently supports BF16 activations only")
+        raise ValueError(
+            "streaming dispatch currently supports BF16 activations only; "
+            f"lane payload has dtype={dispatch.x.dtype}, shape={tuple(dispatch.x.shape)}, "
+            f"source tokens={dispatch.source_topk_idx.size(0)}"
+        )
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
         raise ValueError("streaming MoE currently supports BF16 expert weights only")
     if w13_weight.ndim != 3 or w2_weight.ndim != 3:
@@ -341,6 +535,8 @@ def launch_bf16_streaming_moe(
         (gate_up, down_input, w13_weight, w2_weight),
         streams=streams,
         drain_stream=drain_stream,
+        timeline_context=timeline_context,
+        timeline_origin=timeline_origin,
     )
 
 
@@ -354,6 +550,8 @@ def launch_fp8_streaming_moe(
     *,
     streams: Sequence[torch.cuda.Stream] | None = None,
     drain_stream: torch.cuda.Stream | None = None,
+    timeline_context: dict[str, Any] | None = None,
+    timeline_origin: torch.cuda.Event | None = None,
 ) -> DeepEPStreamingLayerResult:
     """Run a block-FP8 expert MLP directly over each ready source lane.
 
@@ -466,4 +664,6 @@ def launch_fp8_streaming_moe(
         (gate_up, w13_weight, w2_weight, w13_scale, w2_scale),
         streams=streams,
         drain_stream=drain_stream,
+        timeline_context=timeline_context,
+        timeline_origin=timeline_origin,
     )

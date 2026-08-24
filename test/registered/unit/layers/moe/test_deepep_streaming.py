@@ -5,6 +5,7 @@ import pytest
 
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
+    _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
     configure_deepep_streaming_environment,
     launch_fp8_streaming_moe,
@@ -67,6 +68,17 @@ def test_streaming_layer_keeps_dependencies_on_device():
     assert "streaming_combine_reduce" in source
     assert ".synchronize(" not in source
     assert ".barrier(" not in source
+
+
+def test_timeline_decodes_aligned_lane_psum_without_counting_holes():
+    layout = _lane_layout_from_psum([3, 128, 133])
+
+    assert layout["expert_starts"] == [0, 128, 128]
+    assert layout["expert_rows"] == [3, 0, 5]
+    assert layout["useful_rows"] == 8
+    assert layout["active_span_rows"] == 133
+    assert layout["alignment_hole_rows"] == 125
+    assert layout["nonempty_experts"] == 2
 
 
 def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
