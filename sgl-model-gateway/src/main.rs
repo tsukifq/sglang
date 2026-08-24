@@ -147,7 +147,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "rank_power_of_two", "rank_least_loaded", "rank_total_tokens", "rank_consistent_hash", "prefix_only_lpm", "lmetric", "preble_e2_prefill", "dualmap", "smetric", "chunk_lmetric", "cache_aware_p2c", "cache_aware_rank"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -161,6 +161,42 @@ struct CliArgs {
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
+
+    /// Maximum age of a successful per-rank load snapshot
+    #[arg(long, default_value_t = 250, help_heading = "Routing Policy")]
+    rank_load_max_staleness_ms: u64,
+
+    /// Per-engine timeout for rank_total_tokens load snapshots
+    #[arg(long, default_value_t = 200, help_heading = "Routing Policy")]
+    rank_load_request_timeout_ms: u64,
+
+    /// Minimum exact cached-prefix tokens for SMetric session affinity
+    #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
+    smetric_min_match_tokens: usize,
+
+    /// Effective per-rank prefill chunk size used by chunk_lmetric
+    #[arg(long, default_value_t = 4096, help_heading = "Routing Policy")]
+    dp_rank_chunk_size: usize,
+
+    /// Recent assignment-history window used by preble_e2_prefill
+    #[arg(long, default_value_t = 180, help_heading = "Routing Policy")]
+    preble_history_window_secs: u64,
+
+    /// Virtual prefill-token budget calibrated to DualMap's target TTFT SLO
+    #[arg(long, default_value_t = 16384, help_heading = "Routing Policy")]
+    dualmap_slo_token_threshold: usize,
+
+    /// Sliding request window used by DualMap adaptive-prefix hotness
+    #[arg(long, default_value_t = 200, help_heading = "Routing Policy")]
+    dualmap_prefix_window_size: usize,
+
+    /// Minimum observations before DualMap adapts the prefix depth
+    #[arg(long, default_value_t = 20, help_heading = "Routing Policy")]
+    dualmap_prefix_min_samples: usize,
+
+    /// Tokens per DualMap adaptive routing-prefix block
+    #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
+    dualmap_prefix_block_tokens: usize,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -769,6 +805,36 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+            },
+            "rank_power_of_two" => PolicyConfig::RankPowerOfTwo,
+            "rank_least_loaded" => PolicyConfig::RankLeastLoaded,
+            "rank_total_tokens" => PolicyConfig::RankTotalTokens {
+                max_staleness_ms: self.rank_load_max_staleness_ms,
+                request_timeout_ms: self.rank_load_request_timeout_ms,
+            },
+            "rank_consistent_hash" => PolicyConfig::RankConsistentHash,
+            "prefix_only_lpm" => PolicyConfig::PrefixOnlyLpm,
+            "lmetric" => PolicyConfig::LMetric,
+            "preble_e2_prefill" => PolicyConfig::PrebleE2Prefill {
+                history_window_secs: self.preble_history_window_secs,
+            },
+            "dualmap" => PolicyConfig::DualMap {
+                slo_token_threshold: self.dualmap_slo_token_threshold,
+                prefix_window_size: self.dualmap_prefix_window_size,
+                prefix_min_samples: self.dualmap_prefix_min_samples,
+                prefix_block_tokens: self.dualmap_prefix_block_tokens,
+            },
+            "smetric" => PolicyConfig::SMetric {
+                min_match_tokens: self.smetric_min_match_tokens,
+            },
+            "chunk_lmetric" => PolicyConfig::ChunkLMetric {
+                chunk_size: self.dp_rank_chunk_size,
+            },
+            "cache_aware_p2c" => PolicyConfig::CacheAwarePowerOfTwo,
+            "cache_aware_rank" => PolicyConfig::CacheAwareRank {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,

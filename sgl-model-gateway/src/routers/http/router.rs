@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -23,11 +29,11 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::GenerationRequest,
+        common::{GenerationRequest, InputIds},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -36,12 +42,49 @@ use crate::{
     },
     routers::{
         error::{self, extract_error_code_from_response},
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::utils::{
+            error_type_from_status, filter_chat_request_by_tool_choice, process_chat_messages,
+            route_to_endpoint,
+        },
         header_utils,
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
+    tokenizer::registry::TokenizerRegistry,
 };
+
+const SELECTION_ID_HEADER: &str = "x-async-moe-selection-id";
+static NEXT_SELECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Couples the existing worker in-flight counter with policy-local work
+/// reservations.  It follows the response body for streaming requests, so
+/// cleanup also happens on upstream failure or client disconnect.
+struct PolicyTrackedGuard {
+    _worker_load_guard: WorkerLoadGuard,
+    policy: Arc<dyn LoadBalancingPolicy>,
+    selection_id: u64,
+}
+
+impl PolicyTrackedGuard {
+    fn new(
+        worker: Arc<dyn Worker>,
+        headers: Option<&HeaderMap>,
+        policy: Arc<dyn LoadBalancingPolicy>,
+        selection_id: u64,
+    ) -> Self {
+        Self {
+            _worker_load_guard: WorkerLoadGuard::new(worker, headers),
+            policy,
+            selection_id,
+        }
+    }
+}
+
+impl Drop for PolicyTrackedGuard {
+    fn drop(&mut self) {
+        self.policy.on_request_finished(self.selection_id);
+    }
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -51,6 +94,7 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
 }
 
 impl std::fmt::Debug for Router {
@@ -76,6 +120,7 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            tokenizer_registry: ctx.tokenizer_registry.clone(),
         })
     }
 
@@ -135,8 +180,10 @@ impl Router {
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+        selection_id: u64,
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn LoadBalancingPolicy>)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -168,13 +215,21 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
+        // This header is policy-internal: it is passed only to selection and
+        // never added to the upstream request headers.
+        let mut policy_headers = headers.cloned().unwrap_or_default();
+        policy_headers.insert(
+            SELECTION_ID_HEADER,
+            HeaderValue::from_str(&selection_id.to_string()).ok()?,
+        );
+
         let idx = policy
             .select_worker(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                    headers,
+                    tokens,
+                    headers: Some(&policy_headers),
                     hash_ring,
                 },
             )
@@ -188,7 +243,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((available[idx].clone(), policy))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -197,6 +252,7 @@ impl Router {
         typed_req: &T,
         route: &'static str,
         model_id: Option<&str>,
+        routing_tokens: Option<&[u32]>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -219,7 +275,15 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        is_stream,
+                        &text,
+                        routing_tokens,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -278,12 +342,14 @@ impl Router {
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
+        routing_tokens: Option<&[u32]>,
     ) -> Response {
-        let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
+        let selection_id = NEXT_SELECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let (worker, policy) = match self
+            .select_worker_for_model(model_id, Some(text), routing_tokens, headers, selection_id)
             .await
         {
-            Some(w) => w,
+            Some(selection) => selection,
             None => {
                 return error::service_unavailable(
                     "no_available_workers",
@@ -292,14 +358,9 @@ impl Router {
             }
         };
 
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = policy.tracks_inflight_load().then(|| {
+            PolicyTrackedGuard::new(worker.clone(), headers, policy.clone(), selection_id)
+        });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -491,13 +552,13 @@ impl Router {
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
-        load_guard: Option<WorkerLoadGuard>,
+        load_guard: Option<PolicyTrackedGuard>,
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
 
         // Static key string to avoid per-request allocations
-        const DP_RANK_KEY: &str = "data_parallel_rank";
+        const DP_RANK_KEY: &str = "routed_dp_rank";
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -522,6 +583,9 @@ impl Router {
             };
 
             if let Some(map) = json_val.as_object_mut() {
+                // Remove the deprecated client-controlled alias before
+                // committing the authoritative router decision.
+                map.remove("data_parallel_rank");
                 // Use static key string to avoid allocation
                 map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
                 // Only serialize if debug logging is enabled to avoid CPU overhead
@@ -534,7 +598,7 @@ impl Router {
             } else {
                 return error::bad_request(
                     "dp_rank_insertion_failed",
-                    "Failed to insert the data_parallel_rank field into the request body",
+                    "Failed to insert the routed_dp_rank field into the request body",
                 );
             }
 
@@ -752,8 +816,71 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
-            .await
+        let policy = model_id
+            .map(|model| self.policy_registry.get_policy_or_default(model))
+            .unwrap_or_else(|| self.policy_registry.get_default_policy());
+        if !policy.needs_request_tokens() {
+            return self
+                .route_typed_request(headers, body, "/generate", model_id, None)
+                .await;
+        }
+
+        match body.input_ids.as_ref() {
+            Some(InputIds::Single(input_ids)) => {
+                let tokens: Result<Vec<u32>, _> =
+                    input_ids.iter().copied().map(u32::try_from).collect();
+                let Ok(tokens) = tokens else {
+                    return error::bad_request(
+                        "routing_input_ids_invalid",
+                        "DP-rank cache policies require non-negative input_ids",
+                    );
+                };
+                if tokens.is_empty() {
+                    return error::bad_request(
+                        "routing_input_ids_empty",
+                        "DP-rank cache policies require at least one input token",
+                    );
+                }
+                self.route_typed_request(headers, body, "/generate", model_id, Some(&tokens))
+                    .await
+            }
+            Some(InputIds::Batch(_)) => error::bad_request(
+                "routing_batched_input_ids_unsupported",
+                "DP-rank cache policies route one request at a time; batched input_ids are unsupported",
+            ),
+            None => {
+                let Some(text) = body.text.as_deref() else {
+                    return error::bad_request(
+                        "routing_tokens_missing",
+                        "DP-rank cache policies require text or single-request input_ids",
+                    );
+                };
+                let Some(model) = model_id else {
+                    return error::internal_error(
+                        "routing_tokenizer_model_missing",
+                        "DP-rank cache policies require an explicit model id for text input",
+                    );
+                };
+                let Some(tokenizer) = self.tokenizer_registry.get(model) else {
+                    return error::service_unavailable(
+                        "routing_tokenizer_unavailable",
+                        format!("Tokenizer is not loaded for model {model}"),
+                    );
+                };
+                let encoding = match tokenizer.encode(text, false) {
+                    Ok(encoding) => encoding,
+                    Err(err) => {
+                        return error::internal_error(
+                            "routing_tokenization_failed",
+                            format!("Routing tokenization failed: {err}"),
+                        )
+                    }
+                };
+                let tokens = encoding.token_ids().to_vec();
+                self.route_typed_request(headers, body, "/generate", model_id, Some(&tokens))
+                    .await
+            }
+        }
     }
 
     async fn route_chat(
@@ -762,8 +889,50 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let policy = model_id
+            .map(|model| self.policy_registry.get_policy_or_default(model))
+            .unwrap_or_else(|| self.policy_registry.get_default_policy());
+        if !policy.needs_request_tokens() {
+            return self
+                .route_typed_request(headers, body, "/v1/chat/completions", model_id, None)
+                .await;
+        }
+
+        let Some(model) = model_id else {
+            return error::internal_error(
+                "routing_tokenizer_model_missing",
+                "DP-rank cache policies require an explicit model id",
+            );
+        };
+        let Some(tokenizer) = self.tokenizer_registry.get(model) else {
+            return error::service_unavailable(
+                "routing_tokenizer_unavailable",
+                format!("Tokenizer is not loaded for model {model}"),
+            );
+        };
+        let filtered = filter_chat_request_by_tool_choice(body);
+        let processed = match process_chat_messages(&filtered, tokenizer.as_ref()) {
+            Ok(processed) => processed,
+            Err(err) => return error::bad_request("routing_chat_template_failed", err),
+        };
+        let encoding = match tokenizer.encode(&processed.text, false) {
+            Ok(encoding) => encoding,
+            Err(err) => {
+                return error::internal_error(
+                    "routing_tokenization_failed",
+                    format!("Routing tokenization failed: {err}"),
+                )
+            }
+        };
+        let tokens = encoding.token_ids().to_vec();
+        self.route_typed_request(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            Some(&tokens),
+        )
+        .await
     }
 
     async fn route_completion(
@@ -772,7 +941,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, None)
             .await
     }
 
@@ -782,7 +951,7 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, None)
             .await
     }
 
@@ -807,7 +976,7 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, body, "/v1/embeddings", model_id, None)
             .await
     }
 
@@ -817,7 +986,7 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, body, "/v1/classify", model_id, None)
             .await
     }
 
@@ -828,7 +997,7 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, None)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
@@ -880,6 +1049,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
         }
     }
 

@@ -13,7 +13,9 @@ use crate::core::{HashRing, Worker};
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
+mod dp_rank;
 mod factory;
+pub mod kv_events;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
@@ -25,6 +27,12 @@ pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
+pub use dp_rank::{
+    CacheAwarePowerOfTwoPolicy, CacheAwareRankConfig, CacheAwareRankPolicy, ChunkLMetricPolicy,
+    DualMapConfig, DualMapPolicy, LMetricPolicy, PrebleE2PrefillPolicy, PrefixOnlyLpmPolicy,
+    RankConsistentHashPolicy, RankLeastLoadedPolicy, RankPowerOfTwoPolicy, RankTotalTokensConfig,
+    RankTotalTokensPolicy, SMetricPolicy,
+};
 pub use factory::PolicyFactory;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
@@ -62,12 +70,32 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Release policy-local state reserved for one HTTP routing attempt.
+    /// The router invokes this when the upstream response body completes or
+    /// is dropped, including failures and client disconnects.
+    fn on_request_finished(&self, _selection_id: u64) {
+        // Default: no-op for policies without per-attempt work accounting.
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Whether the policy requires model-tokenizer IDs at selection time.
+    /// Cache policies backed by engine KV events must hash the same token IDs
+    /// as the engine; request text is not an equivalent substitute.
+    fn needs_request_tokens(&self) -> bool {
+        false
+    }
+
+    /// Whether the HTTP transport must hold a per-worker in-flight guard for
+    /// the full upstream request lifetime.
+    fn tracks_inflight_load(&self) -> bool {
+        false
     }
 
     /// Update worker load information

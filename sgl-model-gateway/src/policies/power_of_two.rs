@@ -110,6 +110,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         "power_of_two"
     }
 
+    fn tracks_inflight_load(&self) -> bool {
+        true
+    }
+
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
             *cached = loads.clone();

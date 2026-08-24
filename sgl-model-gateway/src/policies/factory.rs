@@ -3,9 +3,13 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, CacheAwarePowerOfTwoPolicy,
+    CacheAwareRankConfig, CacheAwareRankPolicy, ChunkLMetricPolicy, ConsistentHashingPolicy,
+    DualMapConfig, DualMapPolicy, LMetricPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PowerOfTwoPolicy, PrebleE2PrefillPolicy, PrefixHashConfig, PrefixHashPolicy,
+    PrefixOnlyLpmPolicy, RandomPolicy, RankConsistentHashPolicy, RankLeastLoadedPolicy,
+    RankPowerOfTwoPolicy, RankTotalTokensConfig, RankTotalTokensPolicy, RoundRobinPolicy,
+    SMetricPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +23,48 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::RankPowerOfTwo => Arc::new(RankPowerOfTwoPolicy::new()),
+            PolicyConfig::RankLeastLoaded => Arc::new(RankLeastLoadedPolicy::new()),
+            PolicyConfig::RankTotalTokens {
+                max_staleness_ms,
+                request_timeout_ms,
+            } => Arc::new(RankTotalTokensPolicy::new(RankTotalTokensConfig {
+                max_staleness_ms: *max_staleness_ms,
+                request_timeout_ms: *request_timeout_ms,
+            })),
+            PolicyConfig::RankConsistentHash => Arc::new(RankConsistentHashPolicy::new()),
+            PolicyConfig::PrefixOnlyLpm => Arc::new(PrefixOnlyLpmPolicy::new()),
+            PolicyConfig::LMetric => Arc::new(LMetricPolicy::new()),
+            PolicyConfig::PrebleE2Prefill {
+                history_window_secs,
+            } => Arc::new(PrebleE2PrefillPolicy::new(*history_window_secs)),
+            PolicyConfig::DualMap {
+                slo_token_threshold,
+                prefix_window_size,
+                prefix_min_samples,
+                prefix_block_tokens,
+            } => Arc::new(DualMapPolicy::new(DualMapConfig {
+                slo_token_threshold: *slo_token_threshold,
+                prefix_window_size: *prefix_window_size,
+                prefix_min_samples: *prefix_min_samples,
+                prefix_block_tokens: *prefix_block_tokens,
+            })),
+            PolicyConfig::SMetric { min_match_tokens } => {
+                Arc::new(SMetricPolicy::new(*min_match_tokens))
+            }
+            PolicyConfig::ChunkLMetric { chunk_size } => {
+                Arc::new(ChunkLMetricPolicy::new(*chunk_size))
+            }
+            PolicyConfig::CacheAwarePowerOfTwo => Arc::new(CacheAwarePowerOfTwoPolicy::new()),
+            PolicyConfig::CacheAwareRank {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+            } => Arc::new(CacheAwareRankPolicy::new(CacheAwareRankConfig {
+                cache_threshold: *cache_threshold,
+                balance_abs_threshold: *balance_abs_threshold,
+                balance_rel_threshold: *balance_rel_threshold,
+            })),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -79,6 +125,28 @@ impl PolicyFactory {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+            "rank_power_of_two" | "rankpoweroftwo" => Some(Arc::new(RankPowerOfTwoPolicy::new())),
+            "rank_least_loaded" | "rankleastloaded" => Some(Arc::new(RankLeastLoadedPolicy::new())),
+            "rank_total_tokens" | "ranktotaltokens" => {
+                Some(Arc::new(RankTotalTokensPolicy::default()))
+            }
+            "rank_consistent_hash" | "rankconsistenthash" => {
+                Some(Arc::new(RankConsistentHashPolicy::new()))
+            }
+            "prefix_only_lpm" | "prefixonlylpm" => Some(Arc::new(PrefixOnlyLpmPolicy::new())),
+            "lmetric" => Some(Arc::new(LMetricPolicy::new())),
+            "preble_e2_prefill" | "preblee2prefill" => {
+                Some(Arc::new(PrebleE2PrefillPolicy::default()))
+            }
+            "dualmap" => Some(Arc::new(DualMapPolicy::default())),
+            "smetric" => Some(Arc::new(SMetricPolicy::new(512))),
+            "chunk_lmetric" | "chunklmetric" => Some(Arc::new(ChunkLMetricPolicy::new(4096))),
+            "cache_aware_p2c" | "cacheawarep2c" => {
+                Some(Arc::new(CacheAwarePowerOfTwoPolicy::new()))
+            }
+            "cache_aware_rank" | "cacheawarerank" => {
+                Some(Arc::new(CacheAwareRankPolicy::default()))
+            }
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
@@ -107,6 +175,77 @@ mod tests {
             load_check_interval_secs: 60,
         });
         assert_eq!(policy.name(), "power_of_two");
+
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::RankPowerOfTwo).name(),
+            "rank_power_of_two"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::RankLeastLoaded).name(),
+            "rank_least_loaded"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::RankTotalTokens {
+                max_staleness_ms: 250,
+                request_timeout_ms: 200,
+            })
+            .name(),
+            "rank_total_tokens"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::RankConsistentHash).name(),
+            "rank_consistent_hash"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::PrefixOnlyLpm).name(),
+            "prefix_only_lpm"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::LMetric).name(),
+            "lmetric"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::PrebleE2Prefill {
+                history_window_secs: 180,
+            })
+            .name(),
+            "preble_e2_prefill"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::DualMap {
+                slo_token_threshold: 16_384,
+                prefix_window_size: 200,
+                prefix_min_samples: 20,
+                prefix_block_tokens: 512,
+            })
+            .name(),
+            "dualmap"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::SMetric {
+                min_match_tokens: 512,
+            })
+            .name(),
+            "smetric"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::ChunkLMetric { chunk_size: 4096 })
+                .name(),
+            "chunk_lmetric"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::CacheAwarePowerOfTwo).name(),
+            "cache_aware_p2c"
+        );
+        assert_eq!(
+            PolicyFactory::create_from_config(&PolicyConfig::CacheAwareRank {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            })
+            .name(),
+            "cache_aware_rank"
+        );
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
             cache_threshold: 0.7,
@@ -143,6 +282,14 @@ mod tests {
         assert!(PolicyFactory::create_by_name("RoundRobin").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
+        assert!(PolicyFactory::create_by_name("rank_least_loaded").is_some());
+        assert!(PolicyFactory::create_by_name("rank_total_tokens").is_some());
+        assert!(PolicyFactory::create_by_name("rank_consistent_hash").is_some());
+        assert!(PolicyFactory::create_by_name("preble_e2_prefill").is_some());
+        assert!(PolicyFactory::create_by_name("dualmap").is_some());
+        assert!(PolicyFactory::create_by_name("smetric").is_some());
+        assert!(PolicyFactory::create_by_name("chunk_lmetric").is_some());
+        assert!(PolicyFactory::create_by_name("cache_aware_p2c").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());

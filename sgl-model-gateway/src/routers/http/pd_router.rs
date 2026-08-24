@@ -1879,14 +1879,14 @@ mod tests {
             prefill_request.endpoint_url,
             "http://prefill:30000/v1/completions"
         );
-        assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert_eq!(prefill_request.body["routed_dp_rank"], 2);
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
         assert_eq!(
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
-        assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["routed_dp_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
@@ -1922,8 +1922,8 @@ mod tests {
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
-        assert!(prefill_request.body.get("data_parallel_rank").is_none());
-        assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert!(prefill_request.body.get("routed_dp_rank").is_none());
+        assert!(decode_request.body.get("routed_dp_rank").is_none());
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));

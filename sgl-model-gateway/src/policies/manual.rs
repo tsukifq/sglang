@@ -231,6 +231,10 @@ impl LoadBalancingPolicy for ManualPolicy {
         "manual"
     }
 
+    fn tracks_inflight_load(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

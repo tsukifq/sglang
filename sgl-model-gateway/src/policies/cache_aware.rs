@@ -524,6 +524,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
+    fn tracks_inflight_load(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

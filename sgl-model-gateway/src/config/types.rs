@@ -270,6 +270,78 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
+    /// Power-of-two choices over the virtual workers created for
+    /// attention-DP ranks. Uses gateway-local in-flight request load.
+    #[serde(rename = "rank_power_of_two")]
+    RankPowerOfTwo,
+
+    /// Join-the-shortest-queue over attention-DP ranks using gateway-local
+    /// in-flight request counts.
+    #[serde(rename = "rank_least_loaded")]
+    RankLeastLoaded,
+
+    /// SGLang DPC total-token balancing over attention-DP ranks. Engine
+    /// snapshots are augmented by a same-generation gateway-side overlay.
+    #[serde(rename = "rank_total_tokens")]
+    RankTotalTokens {
+        max_staleness_ms: u64,
+        request_timeout_ms: u64,
+    },
+
+    /// Stable session/prompt affinity over the attention-DP rank topology.
+    #[serde(rename = "rank_consistent_hash")]
+    RankConsistentHash,
+
+    /// Exact cache-only longest-prefix match over per-rank KV events.
+    #[serde(rename = "prefix_only_lpm")]
+    PrefixOnlyLpm,
+
+    /// Exact per-rank LMetric: uncached prompt tokens multiplied by load+1.
+    #[serde(rename = "lmetric")]
+    LMetric,
+
+    /// Preble E2's routing-only, prefill-only exploit/explore policy. Recent
+    /// load is uncached prefill-token work assigned within the history window.
+    #[serde(rename = "preble_e2_prefill")]
+    PrebleE2Prefill { history_window_secs: u64 },
+
+    /// DualMap's routing-only entrance scheduler: adaptive partial-prefix
+    /// dual hashing plus an SLO-aware cache-affinity/load decision.
+    #[serde(rename = "dualmap")]
+    DualMap {
+        /// Calibrated virtual prefill-token budget for the target TTFT SLO.
+        slo_token_threshold: usize,
+        /// Number of recent requests used to detect hot prefixes.
+        prefix_window_size: usize,
+        /// Observations required before adapting prefix depth.
+        prefix_min_samples: usize,
+        /// Tokens per adaptive routing-prefix block (paper default: 512).
+        prefix_block_tokens: usize,
+    },
+
+    /// Session-aware cache affinity: cold/first turns use least-load, while
+    /// later turns with a sufficiently long exact prefix remain cache-sticky.
+    #[serde(rename = "smetric")]
+    SMetric { min_match_tokens: usize },
+
+    /// LMetric over the number of uncached prefill chunks rather than raw
+    /// uncached tokens.
+    #[serde(rename = "chunk_lmetric")]
+    ChunkLMetric { chunk_size: usize },
+
+    /// Power-of-two choices scored with exact per-rank KV residency and
+    /// gateway-local in-flight requests.
+    #[serde(rename = "cache_aware_p2c")]
+    CacheAwarePowerOfTwo,
+
+    /// SGLang-style cache/load policy using exact per-rank KV events.
+    #[serde(rename = "cache_aware_rank")]
+    CacheAwareRank {
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+    },
+
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
@@ -345,6 +417,18 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::RankPowerOfTwo => "rank_power_of_two",
+            PolicyConfig::RankLeastLoaded => "rank_least_loaded",
+            PolicyConfig::RankTotalTokens { .. } => "rank_total_tokens",
+            PolicyConfig::RankConsistentHash => "rank_consistent_hash",
+            PolicyConfig::PrefixOnlyLpm => "prefix_only_lpm",
+            PolicyConfig::LMetric => "lmetric",
+            PolicyConfig::PrebleE2Prefill { .. } => "preble_e2_prefill",
+            PolicyConfig::DualMap { .. } => "dualmap",
+            PolicyConfig::SMetric { .. } => "smetric",
+            PolicyConfig::ChunkLMetric { .. } => "chunk_lmetric",
+            PolicyConfig::CacheAwarePowerOfTwo => "cache_aware_p2c",
+            PolicyConfig::CacheAwareRank { .. } => "cache_aware_rank",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
@@ -819,6 +903,29 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let total_tokens = PolicyConfig::RankTotalTokens {
+            max_staleness_ms: 250,
+            request_timeout_ms: 200,
+        };
+        assert_eq!(total_tokens.name(), "rank_total_tokens");
+        assert_eq!(
+            PolicyConfig::RankConsistentHash.name(),
+            "rank_consistent_hash"
+        );
+
+        let preble = PolicyConfig::PrebleE2Prefill {
+            history_window_secs: 180,
+        };
+        assert_eq!(preble.name(), "preble_e2_prefill");
+
+        let dualmap = PolicyConfig::DualMap {
+            slo_token_threshold: 16_384,
+            prefix_window_size: 200,
+            prefix_min_samples: 20,
+            prefix_block_tokens: 512,
+        };
+        assert_eq!(dualmap.name(), "dualmap");
     }
 
     #[test]
@@ -845,6 +952,39 @@ mod tests {
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
         assert!(json.contains("\"load_check_interval_secs\":60"));
+
+        let total_tokens = PolicyConfig::RankTotalTokens {
+            max_staleness_ms: 250,
+            request_timeout_ms: 200,
+        };
+        let json = serde_json::to_string(&total_tokens).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"rank_total_tokens","max_staleness_ms":250,"request_timeout_ms":200}"#
+        );
+        let json = serde_json::to_string(&PolicyConfig::RankConsistentHash).unwrap();
+        assert_eq!(json, r#"{"type":"rank_consistent_hash"}"#);
+
+        let preble = PolicyConfig::PrebleE2Prefill {
+            history_window_secs: 180,
+        };
+        let json = serde_json::to_string(&preble).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"preble_e2_prefill","history_window_secs":180}"#
+        );
+
+        let dualmap = PolicyConfig::DualMap {
+            slo_token_threshold: 16_384,
+            prefix_window_size: 200,
+            prefix_min_samples: 20,
+            prefix_block_tokens: 512,
+        };
+        let json = serde_json::to_string(&dualmap).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"dualmap","slo_token_threshold":16384,"prefix_window_size":200,"prefix_min_samples":20,"prefix_block_tokens":512}"#
+        );
     }
 
     #[test]

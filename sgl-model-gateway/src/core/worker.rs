@@ -1105,8 +1105,9 @@ impl Worker for DPAwareWorker {
 
     async fn prepare_request(&self, mut req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         if let Some(map) = req.as_object_mut() {
+            map.remove("data_parallel_rank");
             map.insert(
-                "data_parallel_rank".to_string(),
+                "routed_dp_rank".to_string(),
                 serde_json::json!(self.dp_rank),
             );
             Ok(req)
@@ -1796,14 +1797,17 @@ mod tests {
 
         let original_req = serde_json::json!({
             "prompt": "Hello",
-            "max_tokens": 100
+            "max_tokens": 100,
+            "data_parallel_rank": 7,
+            "routed_dp_rank": 6
         });
 
         let prepared_req = dp_worker.prepare_request(original_req).await.unwrap();
 
         assert_eq!(prepared_req["prompt"], "Hello");
         assert_eq!(prepared_req["max_tokens"], 100);
-        assert_eq!(prepared_req["data_parallel_rank"], 3);
+        assert_eq!(prepared_req["routed_dp_rank"], 3);
+        assert!(prepared_req.get("data_parallel_rank").is_none());
     }
 
     #[tokio::test]

@@ -1,5 +1,23 @@
 use super::*;
 
+fn is_dp_rank_policy(policy: &PolicyConfig) -> bool {
+    matches!(
+        policy,
+        PolicyConfig::RankPowerOfTwo
+            | PolicyConfig::RankLeastLoaded
+            | PolicyConfig::RankTotalTokens { .. }
+            | PolicyConfig::RankConsistentHash
+            | PolicyConfig::PrefixOnlyLpm
+            | PolicyConfig::LMetric
+            | PolicyConfig::PrebleE2Prefill { .. }
+            | PolicyConfig::DualMap { .. }
+            | PolicyConfig::SMetric { .. }
+            | PolicyConfig::ChunkLMetric { .. }
+            | PolicyConfig::CacheAwarePowerOfTwo
+            | PolicyConfig::CacheAwareRank { .. }
+    )
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
@@ -150,7 +168,87 @@ impl ConfigValidator {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
-            | PolicyConfig::ConsistentHashing => {}
+            | PolicyConfig::ConsistentHashing
+            | PolicyConfig::RankPowerOfTwo
+            | PolicyConfig::RankLeastLoaded
+            | PolicyConfig::RankConsistentHash
+            | PolicyConfig::PrefixOnlyLpm
+            | PolicyConfig::LMetric
+            | PolicyConfig::CacheAwarePowerOfTwo => {}
+            PolicyConfig::RankTotalTokens {
+                max_staleness_ms,
+                request_timeout_ms,
+            } => {
+                for (field, value) in [
+                    ("max_staleness_ms", *max_staleness_ms),
+                    ("request_timeout_ms", *request_timeout_ms),
+                ] {
+                    if value == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                }
+            }
+            PolicyConfig::PrebleE2Prefill {
+                history_window_secs,
+            } => {
+                if *history_window_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "history_window_secs".to_string(),
+                        value: history_window_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::DualMap {
+                slo_token_threshold,
+                prefix_window_size,
+                prefix_min_samples,
+                prefix_block_tokens,
+            } => {
+                for (field, value) in [
+                    ("slo_token_threshold", *slo_token_threshold),
+                    ("prefix_window_size", *prefix_window_size),
+                    ("prefix_min_samples", *prefix_min_samples),
+                    ("prefix_block_tokens", *prefix_block_tokens),
+                ] {
+                    if value == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be > 0".to_string(),
+                        });
+                    }
+                }
+                if prefix_min_samples > prefix_window_size {
+                    return Err(ConfigError::InvalidValue {
+                        field: "prefix_min_samples".to_string(),
+                        value: prefix_min_samples.to_string(),
+                        reason: "Must be <= prefix_window_size".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::SMetric { min_match_tokens } => {
+                if *min_match_tokens == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "min_match_tokens".to_string(),
+                        value: min_match_tokens.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::ChunkLMetric { chunk_size } => {
+                if *chunk_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "chunk_size".to_string(),
+                        value: chunk_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -198,6 +296,26 @@ impl ConfigValidator {
                         field: "load_check_interval_secs".to_string(),
                         value: load_check_interval_secs.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::CacheAwareRank {
+                cache_threshold,
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+            } => {
+                if !(0.0..=1.0).contains(cache_threshold) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_threshold".to_string(),
+                        value: cache_threshold.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
                     });
                 }
             }
@@ -551,11 +669,36 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_mtls(config)?;
+
+        let mode_has_dp_rank_policy = match &config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                prefill_policy.as_ref().is_some_and(is_dp_rank_policy)
+                    || decode_policy.as_ref().is_some_and(is_dp_rank_policy)
+            }
+            _ => false,
+        };
+        if is_dp_rank_policy(&config.policy) || mode_has_dp_rank_policy {
+            if !config.dp_aware {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "DP-rank policies require --dp-aware".to_string(),
+                });
+            }
+            if !matches!(&config.mode, RoutingMode::Regular { .. }) || config.enable_igw {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "DP-rank policies currently require regular, non-IGW routing"
+                        .to_string(),
+                });
+            }
+        }
+
         if config.enable_igw {
             return Ok(());
         }
-
-        Self::validate_mtls(config)?;
 
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
@@ -826,6 +969,88 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_dp_rank_policy_requires_dp_aware_regular_mode() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::PrefixOnlyLpm,
+        );
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("--dp-aware"));
+
+        config.dp_aware = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_preble_history_window_must_be_positive() {
+        let error = ConfigValidator::validate_policy(&PolicyConfig::PrebleE2Prefill {
+            history_window_secs: 0,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("history_window_secs"));
+        assert!(error.to_string().contains("Must be > 0"));
+    }
+
+    #[test]
+    fn test_dualmap_prefix_samples_must_fit_window() {
+        let error = ConfigValidator::validate_policy(&PolicyConfig::DualMap {
+            slo_token_threshold: 16_384,
+            prefix_window_size: 20,
+            prefix_min_samples: 21,
+            prefix_block_tokens: 512,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("prefix_min_samples"));
+        assert!(error.to_string().contains("<= prefix_window_size"));
+    }
+
+    #[test]
+    fn test_rank_total_tokens_intervals_must_be_positive() {
+        for (config, field) in [
+            (
+                PolicyConfig::RankTotalTokens {
+                    max_staleness_ms: 0,
+                    request_timeout_ms: 200,
+                },
+                "max_staleness_ms",
+            ),
+            (
+                PolicyConfig::RankTotalTokens {
+                    max_staleness_ms: 250,
+                    request_timeout_ms: 0,
+                },
+                "request_timeout_ms",
+            ),
+        ] {
+            let error = ConfigValidator::validate_policy(&config).unwrap_err();
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains("Must be > 0"));
+        }
+    }
+
+    #[test]
+    fn test_dp_rank_policy_rejects_pd_mode() {
+        let mut config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: Some(PolicyConfig::LMetric),
+                decode_policy: None,
+            },
+            PolicyConfig::RoundRobin,
+        );
+        config.dp_aware = true;
+
+        let error = ConfigValidator::validate(&config).unwrap_err();
+        assert!(error.to_string().contains("regular, non-IGW"));
     }
 
     #[test]
