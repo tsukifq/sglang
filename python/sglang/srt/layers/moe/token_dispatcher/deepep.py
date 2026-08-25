@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.profiling import record_moe_timeline_event
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     DispatcherOutputDtype,
@@ -1096,6 +1097,7 @@ class DeepEPDispatcher(BaseDispatcher):
                 "source-local combine path"
             )
         self.dispatch_a(hidden_states, topk_output)
+        record_moe_timeline_event("dispatch_prepare_done")
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
@@ -1135,6 +1137,7 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        record_moe_timeline_event("combine_prepare_done")
         ret = self.combine_b()
         return ret
 

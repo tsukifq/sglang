@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import time
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -39,6 +40,12 @@ from sglang.srt.layers.moe.deepep_streaming import (
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
+)
+from sglang.srt.layers.moe.profiling import (
+    ensure_moe_timeline_collector,
+    moe_timeline_scope,
+    record_moe_timeline_event,
+    submit_moe_timeline_collection,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
@@ -378,6 +385,64 @@ class FusedMoE(torch.nn.Module):
         self._deepep_streaming_inflight = None
         self._deepep_streaming_fp8 = False
         self._deepep_timeline_calls = 0
+        self._deepep_timeline_target_call = 0
+        self._deepep_timeline_call_stride = 0
+        self._deepep_timeline_call_offset = 0
+        self._deepep_timeline_detail = "full"
+        self._deepep_timeline_enable_file = ""
+        self._deepep_timeline_layer_weight = 1
+        self._deepep_timeline_selected_layer = False
+        timeline_enabled = os.getenv("SGLANG_DEEPEP_TIMELINE", "0").lower()
+        if timeline_enabled not in ("", "0", "false", "no", "n"):
+            try:
+                layer_spec = os.getenv("SGLANG_DEEPEP_TIMELINE_LAYERS", "").strip()
+                target_layers = (
+                    {int(value) for value in layer_spec.split(",") if value.strip()}
+                    if layer_spec
+                    else {int(os.getenv("SGLANG_DEEPEP_TIMELINE_LAYER", "0"))}
+                )
+                self._deepep_timeline_target_call = int(
+                    os.getenv("SGLANG_DEEPEP_TIMELINE_CALL", "0")
+                )
+                self._deepep_timeline_call_stride = int(
+                    os.getenv("SGLANG_DEEPEP_TIMELINE_CALL_STRIDE", "0")
+                )
+                self._deepep_timeline_call_offset = int(
+                    os.getenv("SGLANG_DEEPEP_TIMELINE_CALL_OFFSET", "0")
+                )
+                self._deepep_timeline_layer_weight = int(
+                    os.getenv("SGLANG_DEEPEP_TIMELINE_LAYER_WEIGHT", "1")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "DeepEP timeline layer/call sampling values must be integers"
+                ) from error
+            if self._deepep_timeline_call_stride < 0:
+                raise ValueError("SGLANG_DEEPEP_TIMELINE_CALL_STRIDE must be nonnegative")
+            if self._deepep_timeline_call_stride and not (
+                0 <= self._deepep_timeline_call_offset
+                < self._deepep_timeline_call_stride
+            ):
+                raise ValueError(
+                    "SGLANG_DEEPEP_TIMELINE_CALL_OFFSET must be within the stride"
+                )
+            if self._deepep_timeline_layer_weight <= 0:
+                raise ValueError("SGLANG_DEEPEP_TIMELINE_LAYER_WEIGHT must be positive")
+            self._deepep_timeline_detail = os.getenv(
+                "SGLANG_DEEPEP_TIMELINE_DETAIL", "full"
+            ).strip().lower()
+            if self._deepep_timeline_detail not in ("full", "arrival"):
+                raise ValueError(
+                    "SGLANG_DEEPEP_TIMELINE_DETAIL must be full or arrival"
+                )
+            self._deepep_timeline_enable_file = os.getenv(
+                "SGLANG_DEEPEP_TIMELINE_ENABLE_FILE", ""
+            ).strip()
+            self._deepep_timeline_selected_layer = (
+                get_moe_a2a_backend().is_deepep() and self.layer_id in target_layers
+            )
+            if self._deepep_timeline_selected_layer:
+                ensure_moe_timeline_collector()
         if getattr(self.dispatcher, "streaming_enabled", False):
             self._validate_deepep_streaming()
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
@@ -497,50 +562,137 @@ class FusedMoE(torch.nn.Module):
             )
 
     def _deepep_timeline_context(self, mode: str) -> Optional[dict]:
-        """Select one DeepEP layer invocation for an intrusive GPU timeline."""
+        """Select one DeepEP layer invocation for a deferred GPU timeline."""
 
+        if not self._deepep_timeline_selected_layer:
+            return None
         call_index = self._deepep_timeline_calls
         self._deepep_timeline_calls += 1
-        enabled = os.getenv("SGLANG_DEEPEP_TIMELINE", "0").lower()
-        if enabled in ("", "0", "false", "no", "n"):
+        if self._deepep_timeline_enable_file and not os.path.exists(
+            self._deepep_timeline_enable_file
+        ):
             return None
-        if not get_moe_a2a_backend().is_deepep():
-            return None
-        try:
-            target_layer = int(os.getenv("SGLANG_DEEPEP_TIMELINE_LAYER", "0"))
-            target_call = int(os.getenv("SGLANG_DEEPEP_TIMELINE_CALL", "0"))
-        except ValueError as error:
-            raise ValueError(
-                "SGLANG_DEEPEP_TIMELINE_LAYER and _CALL must be integers"
-            ) from error
-        if self.layer_id != target_layer or call_index != target_call:
+        if self._deepep_timeline_call_stride:
+            if (
+                call_index % self._deepep_timeline_call_stride
+                != self._deepep_timeline_call_offset
+            ):
+                return None
+        elif call_index != self._deepep_timeline_target_call:
             return None
         return {
             "rank": self.moe_ep_rank,
             "layer_id": self.layer_id,
             "call_index": call_index,
             "mode": mode,
+            "profile_detail": self._deepep_timeline_detail,
+            "sampling": {
+                "call_stride": self._deepep_timeline_call_stride or 1,
+                "call_offset": self._deepep_timeline_call_offset,
+                "layer_weight": self._deepep_timeline_layer_weight,
+            },
         }
 
-    def _baseline_logical_outbound_dispatch(
-        self,
+    @staticmethod
+    def _emit_arrival_timeline(
+        context: dict,
+        origin: torch.cuda.Event,
+        output_ready: torch.cuda.Event,
         hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ) -> list[dict]:
-        """Count source payload bytes, excluding DeepEP protocol traffic."""
+    ) -> None:
+        """Queue a minimal cross-rank MoE-entry sample off the serving thread."""
 
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            return []
-        topk_ids = topk_output.topk_ids
-        hidden_bytes = hidden_states.size(1) * hidden_states.element_size()
-        route_metadata_bytes = topk_ids.size(1) * (
-            torch.tensor([], dtype=torch.int64).element_size()
-            + topk_output.topk_weights.element_size()
-        )
+        defer_started_ns = time.monotonic_ns()
+        device = hidden_states.device
+        input_tokens = hidden_states.size(0)
+        context = dict(context)
+        defer_state = {"done_ns": None}
+
+        def collect() -> None:
+            collector_started_ns = time.monotonic_ns()
+            with torch.cuda.device(device):
+                output_ready.synchronize()
+                output_wait_done_ns = time.monotonic_ns()
+                profile_stream = torch.cuda.Stream(device=device, priority=0)
+                clock_anchor = torch.cuda.Event(enable_timing=True)
+                anchor_bracket_start_ns = time.monotonic_ns()
+                clock_anchor.record(profile_stream)
+                clock_anchor.synchronize()
+                anchor_bracket_end_ns = time.monotonic_ns()
+
+            anchor_midpoint_ns = (
+                anchor_bracket_start_ns + anchor_bracket_end_ns
+            ) // 2
+
+            def aligned_timestamp(event: torch.cuda.Event) -> dict:
+                return {
+                    "host_monotonic_ns_estimate": round(
+                        anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
+                    )
+                }
+
+            collector_before_log_ns = time.monotonic_ns()
+            serving_done_ns = defer_state["done_ns"]
+            payload = {
+                "schema": "sglang-deepep-arrival-timeline-v1",
+                **context,
+                "input_tokens": input_tokens,
+                "profiler_overhead": {
+                    "serving_thread_synchronized": False,
+                    "serving_thread_defer_us": (
+                        (serving_done_ns - defer_started_ns) / 1e3
+                        if serving_done_ns is not None
+                        else None
+                    ),
+                    "collector_queue_delay_us": (
+                        collector_started_ns - defer_started_ns
+                    )
+                    / 1e3,
+                    "collector_wait_for_output_ms": (
+                        output_wait_done_ns - collector_started_ns
+                    )
+                    / 1e6,
+                    "collector_before_log_ms": (
+                        collector_before_log_ns - collector_started_ns
+                    )
+                    / 1e6,
+                    "metadata_d2h_bytes": 0,
+                    "timed_cuda_event_count": 2,
+                },
+                "clock_alignment": {
+                    "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                    "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
+                    "anchor_bracket_start_ns": anchor_bracket_start_ns,
+                    "anchor_bracket_end_ns": anchor_bracket_end_ns,
+                    "uncertainty_ns": (
+                        anchor_bracket_end_ns - anchor_bracket_start_ns
+                    )
+                    // 2,
+                },
+                "arrival_timestamps": {
+                    "moe_entry": aligned_timestamp(origin),
+                    "output_ready": aligned_timestamp(output_ready),
+                },
+            }
+            print("DEEPEP_ARRIVAL_TIMELINE " + json.dumps(payload), flush=True)
+
+        submit_moe_timeline_collection(collect)
+        defer_state["done_ns"] = time.monotonic_ns()
+
+    @staticmethod
+    def _baseline_logical_outbound_dispatch_from_host(
+        topk_ids: torch.Tensor,
+        moe_ep_size: int,
+        num_local_experts: int,
+        hidden_bytes: int,
+        route_metadata_bytes: int,
+    ) -> list[dict]:
+        """Count logical payload on a deferred host snapshot."""
+
         destinations = []
-        for destination in range(self.moe_ep_size):
-            lower = destination * self.num_local_experts
-            upper = lower + self.num_local_experts
+        for destination in range(moe_ep_size):
+            lower = destination * num_local_experts
+            upper = lower + num_local_experts
             routed = (topk_ids >= lower) & (topk_ids < upper)
             unique_tokens = int(routed.any(dim=1).sum().item())
             routes = int(routed.sum().item())
@@ -559,52 +711,240 @@ class FusedMoE(torch.nn.Module):
         self,
         context: dict,
         origin: torch.cuda.Event,
-        dispatch_done: torch.cuda.Event,
-        gemm_done: torch.cuda.Event,
-        combine_done: torch.cuda.Event,
+        timeline: dict,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         dispatch_output: DispatchOutput,
         dispatch_buffer_rows: int,
     ) -> None:
-        """Synchronize and print one explicitly requested baseline sample."""
+        """Queue one sample for collection outside the serving thread."""
 
-        combine_done.synchronize()
-        outbound = self._baseline_logical_outbound_dispatch(
-            hidden_states, topk_output
-        )
-        dispatch_ms = origin.elapsed_time(dispatch_done)
-        logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+        defer_started_ns = time.monotonic_ns()
+        events = dict(timeline["events"])
+        recorded = frozenset(timeline["recorded"])
+        output_ready = events["output_ready"]
+        device = hidden_states.device
+        input_tokens = hidden_states.size(0)
+        runner_backend = get_moe_runner_backend().value
         runner_rows = list(dispatch_output.num_recv_tokens_per_expert)
-        payload = {
-            "schema": "sglang-deepep-baseline-timeline-v2",
-            **context,
-            "input_tokens": hidden_states.size(0),
-            "dispatch": {
-                "done_ms": dispatch_ms,
-                "elapsed_ms": dispatch_ms,
-                "logical_outbound_payload_bytes": logical_bytes,
-                "logical_outbound_gbps": logical_bytes / (dispatch_ms * 1e6),
-                "destinations": outbound,
-                "received_buffer_rows_before_runner": dispatch_buffer_rows,
-                "runner_rows": sum(runner_rows),
-                "runner_nonempty_experts": sum(row > 0 for row in runner_rows),
-                "runner_max_expert_rows": max(runner_rows, default=0),
-                "runner_rows_per_expert": runner_rows,
-            },
-            "grouped_mlp": {
-                "start_ms": origin.elapsed_time(dispatch_done),
-                "done_ms": origin.elapsed_time(gemm_done),
-                "elapsed_ms": dispatch_done.elapsed_time(gemm_done),
-            },
-            "combine": {
-                "start_ms": origin.elapsed_time(gemm_done),
-                "done_ms": origin.elapsed_time(combine_done),
-                "elapsed_ms": gemm_done.elapsed_time(combine_done),
-            },
-            "total_ms": origin.elapsed_time(combine_done),
-        }
-        print("DEEPEP_BASELINE_TIMELINE " + json.dumps(payload), flush=True)
+        topk_ids = (
+            topk_output.topk_ids.detach()
+            if TopKOutputChecker.format_is_standard(topk_output)
+            else None
+        )
+        hidden_bytes = hidden_states.size(1) * hidden_states.element_size()
+        route_metadata_bytes = (
+            topk_output.topk_ids.size(1)
+            * (
+                topk_output.topk_ids.element_size()
+                + topk_output.topk_weights.element_size()
+            )
+            if topk_ids is not None
+            else 0
+        )
+        moe_ep_size = self.moe_ep_size
+        num_local_experts = self.num_local_experts
+        context = dict(context)
+        defer_state = {"done_ns": None}
+
+        def collect() -> None:
+            collector_started_ns = time.monotonic_ns()
+            with torch.cuda.device(device):
+                output_ready.synchronize()
+                output_wait_done_ns = time.monotonic_ns()
+
+                # The serving stream is never synchronized. Once its output
+                # event is complete, calibrate on a private idle stream so
+                # later serving work cannot move the host-clock anchor.
+                profile_stream = torch.cuda.Stream(device=device, priority=0)
+                clock_anchor = torch.cuda.Event(enable_timing=True)
+                anchor_bracket_start_ns = time.monotonic_ns()
+                clock_anchor.record(profile_stream)
+                clock_anchor.synchronize()
+                anchor_bracket_end_ns = time.monotonic_ns()
+
+                topk_ids_host = None
+                metadata_d2h_bytes = 0
+                if topk_ids is not None:
+                    topk_ids_host = torch.empty(
+                        topk_ids.shape,
+                        dtype=topk_ids.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    metadata_done = torch.cuda.Event()
+                    with torch.cuda.stream(profile_stream):
+                        topk_ids_host.copy_(topk_ids, non_blocking=True)
+                        metadata_done.record(profile_stream)
+                    metadata_done.synchronize()
+                    metadata_d2h_bytes = (
+                        topk_ids_host.numel() * topk_ids_host.element_size()
+                    )
+
+            anchor_midpoint_ns = (anchor_bracket_start_ns + anchor_bracket_end_ns) // 2
+
+            def aligned_timestamp(event: torch.cuda.Event) -> dict:
+                rank_local_ms = origin.elapsed_time(event)
+                return {
+                    "rank_local_ms": rank_local_ms,
+                    "host_monotonic_ns_estimate": round(
+                        anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
+                    ),
+                }
+
+            arrival_timestamps = {"moe_entry": aligned_timestamp(origin)}
+            arrival_timestamps.update(
+                {name: aligned_timestamp(events[name]) for name in sorted(recorded)}
+            )
+            outbound = (
+                self._baseline_logical_outbound_dispatch_from_host(
+                    topk_ids_host,
+                    moe_ep_size,
+                    num_local_experts,
+                    hidden_bytes,
+                    route_metadata_bytes,
+                )
+                if topk_ids_host is not None
+                else []
+            )
+            dispatch_done = events["dispatch_done"]
+            gemm_done = events["gemm_done"]
+            combine_done = events["combine_done"]
+            dispatch_ms = origin.elapsed_time(dispatch_done)
+            logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+
+            required_detail = {
+                "dispatch_prepare_done",
+                "dispatch_done",
+                "runner_pre_permute_done",
+                "w13_done",
+                "activation_done",
+                "w2_done",
+                "runner_post_permute_done",
+                "gemm_done",
+                "combine_prepare_done",
+                "combine_done",
+                "output_ready",
+            }
+            detail_available = required_detail.issubset(recorded)
+            breakdown = {
+                "available": detail_available,
+                "recorded_events": sorted(recorded),
+            }
+            if detail_available:
+
+                def interval(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
+                    return start.elapsed_time(end)
+
+                stages = {
+                    "dispatch_prepare_ms": interval(
+                        origin, events["dispatch_prepare_done"]
+                    ),
+                    "dispatch_transport_wait_ms": interval(
+                        events["dispatch_prepare_done"], dispatch_done
+                    ),
+                    "runner_pre_permute_ms": interval(
+                        dispatch_done, events["runner_pre_permute_done"]
+                    ),
+                    "w13_ms": interval(
+                        events["runner_pre_permute_done"], events["w13_done"]
+                    ),
+                    "activation_ms": interval(
+                        events["w13_done"], events["activation_done"]
+                    ),
+                    "w2_ms": interval(events["activation_done"], events["w2_done"]),
+                    "runner_post_permute_ms": interval(
+                        events["w2_done"], events["runner_post_permute_done"]
+                    ),
+                    "runner_finalize_ms": interval(
+                        events["runner_post_permute_done"], gemm_done
+                    ),
+                    "combine_prepare_ms": interval(
+                        gemm_done, events["combine_prepare_done"]
+                    ),
+                    "combine_transport_wait_ms": interval(
+                        events["combine_prepare_done"], combine_done
+                    ),
+                    "output_finalize_ms": interval(combine_done, output_ready),
+                }
+                breakdown.update(
+                    {
+                        "stages": stages,
+                        "stage_sum_ms": sum(stages.values()),
+                        "event_points_ms": {
+                            name: origin.elapsed_time(events[name])
+                            for name in sorted(required_detail)
+                        },
+                    }
+                )
+            collector_before_log_ns = time.monotonic_ns()
+            serving_done_ns = defer_state["done_ns"]
+            payload = {
+                "schema": "sglang-deepep-baseline-timeline-v4",
+                **context,
+                "input_tokens": input_tokens,
+                "runner_backend": runner_backend,
+                "profiler_overhead": {
+                    "serving_thread_synchronized": False,
+                    "serving_thread_defer_us": (
+                        (serving_done_ns - defer_started_ns) / 1e3
+                        if serving_done_ns is not None
+                        else None
+                    ),
+                    "collector_queue_delay_us": (
+                        collector_started_ns - defer_started_ns
+                    )
+                    / 1e3,
+                    "collector_wait_for_output_ms": (
+                        output_wait_done_ns - collector_started_ns
+                    )
+                    / 1e6,
+                    "collector_before_log_ms": (
+                        collector_before_log_ns - collector_started_ns
+                    )
+                    / 1e6,
+                    "metadata_d2h_bytes": metadata_d2h_bytes,
+                    "timed_cuda_event_count": len(recorded) + 1,
+                },
+                "clock_alignment": {
+                    "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                    "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
+                    "anchor_bracket_start_ns": anchor_bracket_start_ns,
+                    "anchor_bracket_end_ns": anchor_bracket_end_ns,
+                    "uncertainty_ns": (anchor_bracket_end_ns - anchor_bracket_start_ns)
+                    // 2,
+                },
+                "arrival_timestamps": arrival_timestamps,
+                "dispatch": {
+                    "done_ms": dispatch_ms,
+                    "elapsed_ms": dispatch_ms,
+                    "logical_outbound_payload_bytes": logical_bytes,
+                    "logical_outbound_gbps": logical_bytes / (dispatch_ms * 1e6),
+                    "destinations": outbound,
+                    "received_buffer_rows_before_runner": dispatch_buffer_rows,
+                    "runner_rows": sum(runner_rows),
+                    "runner_nonempty_experts": sum(row > 0 for row in runner_rows),
+                    "runner_max_expert_rows": max(runner_rows, default=0),
+                    "runner_rows_per_expert": runner_rows,
+                },
+                "grouped_mlp": {
+                    "start_ms": origin.elapsed_time(dispatch_done),
+                    "done_ms": origin.elapsed_time(gemm_done),
+                    "elapsed_ms": dispatch_done.elapsed_time(gemm_done),
+                },
+                "combine": {
+                    "start_ms": origin.elapsed_time(gemm_done),
+                    "done_ms": origin.elapsed_time(combine_done),
+                    "elapsed_ms": gemm_done.elapsed_time(combine_done),
+                },
+                "output_finalize_ms": combine_done.elapsed_time(output_ready),
+                "total_ms": origin.elapsed_time(output_ready),
+                "breakdown": breakdown,
+            }
+            print("DEEPEP_BASELINE_TIMELINE " + json.dumps(payload), flush=True)
+
+        submit_moe_timeline_collection(collect)
+        defer_state["done_ns"] = time.monotonic_ns()
 
     def _forward_deepep_streaming(
         self,
@@ -1543,54 +1883,90 @@ class FusedMoE(torch.nn.Module):
             return final_hidden_states[..., :origin_hidden_states_dim].contiguous()
 
         timeline_context = self._deepep_timeline_context("baseline")
-        timeline_origin = None
-        dispatch_done = None
-        gemm_done = None
-        combine_done = None
-        if timeline_context is not None:
-            timeline_origin = torch.cuda.Event(enable_timing=True)
-            dispatch_done = torch.cuda.Event(enable_timing=True)
-            gemm_done = torch.cuda.Event(enable_timing=True)
-            combine_done = torch.cuda.Event(enable_timing=True)
-            timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
-
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
-        dispatch_buffer_rows = dispatch_output.hidden_states.size(0)
-        if dispatch_done is not None:
-            dispatch_done.record(torch.cuda.current_stream(hidden_states.device))
-
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
-        if gemm_done is not None:
-            gemm_done.record(torch.cuda.current_stream(hidden_states.device))
-
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
-            if combine_done is not None:
-                combine_done.record(torch.cuda.current_stream(hidden_states.device))
-
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
-
-        if timeline_context is not None:
-            self._emit_baseline_timeline(
-                timeline_context,
-                timeline_origin,
-                dispatch_done,
-                gemm_done,
-                combine_done,
-                hidden_states,
-                topk_output,
-                dispatch_output,
-                dispatch_buffer_rows,
+        if timeline_context is None:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
             )
+            combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+        else:
+            timeline_origin = torch.cuda.Event(enable_timing=True)
+            event_names = (
+                ("output_ready",)
+                if timeline_context["profile_detail"] == "arrival"
+                else (
+                    "dispatch_prepare_done",
+                    "dispatch_done",
+                    "runner_pre_permute_done",
+                    "w13_done",
+                    "activation_done",
+                    "w2_done",
+                    "runner_post_permute_done",
+                    "runner_fused_done",
+                    "gemm_done",
+                    "combine_prepare_done",
+                    "combine_done",
+                    "output_ready",
+                )
+            )
+            timeline = {
+                "events": {
+                    name: torch.cuda.Event(enable_timing=True) for name in event_names
+                },
+                "recorded": set(),
+            }
+            timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
+            with moe_timeline_scope(timeline):
+                dispatch_output = self.dispatcher.dispatch(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+                dispatch_buffer_rows = dispatch_output.hidden_states.size(0)
+                record_moe_timeline_event("dispatch_done")
+
+                combine_input = self.run_moe_core(
+                    dispatch_output=dispatch_output,
+                )
+                record_moe_timeline_event("gemm_done")
+
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    final_hidden_states = self.dispatcher.combine(
+                        combine_input=combine_input
+                    )
+                    record_moe_timeline_event("combine_done")
+
+                    # TODO: should we add some conditions here?
+                    final_hidden_states = final_hidden_states[
+                        ..., :origin_hidden_states_dim
+                    ].contiguous()
+                    record_moe_timeline_event("output_ready")
+
+            if timeline_context["profile_detail"] == "arrival":
+                self._emit_arrival_timeline(
+                    timeline_context,
+                    timeline_origin,
+                    timeline["events"]["output_ready"],
+                    hidden_states,
+                )
+            else:
+                self._emit_baseline_timeline(
+                    timeline_context,
+                    timeline_origin,
+                    timeline,
+                    hidden_states,
+                    topk_output,
+                    dispatch_output,
+                    dispatch_buffer_rows,
+                )
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

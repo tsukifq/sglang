@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.profiling import submit_moe_timeline_collection
 
 _DEEPEP_STREAMING_REQUIRED_ENV = {
     "EP_EXPERIMENTAL_STREAMING_LANES": "1",
@@ -196,8 +198,12 @@ def _lane_layout_from_psum(psum: Sequence[int]) -> dict[str, Any]:
     }
 
 
-def _logical_outbound_dispatch(
-    dispatch: DeepEPStreamingDispatch,
+def _logical_outbound_dispatch_from_host(
+    topk_idx: torch.Tensor,
+    lanes: int,
+    local_experts: int,
+    hidden_bytes: int,
+    route_metadata_bytes: int,
 ) -> list[dict[str, int]]:
     """Count routed payload bytes without claiming physical link traffic.
 
@@ -206,13 +212,6 @@ def _logical_outbound_dispatch(
     count excludes protocol headers, count matrices, and cache-line traffic.
     """
 
-    topk_idx = dispatch.source_topk_idx
-    lanes = dispatch.x.size(0)
-    local_experts = dispatch.expert_psum.size(1)
-    hidden_bytes = dispatch.x.size(2) * dispatch.x.element_size()
-    route_metadata_bytes = topk_idx.size(1) * (
-        topk_idx.element_size() + torch.tensor([], dtype=torch.float32).element_size()
-    )
     destinations = []
     for destination in range(lanes):
         lower = destination * local_experts
@@ -241,63 +240,184 @@ def _emit_streaming_timeline(
     reduce_start: torch.cuda.Event,
     reduce_done: torch.cuda.Event,
 ) -> None:
-    """Synchronize and print one explicitly requested diagnostic sample."""
+    """Queue one streaming sample for collection off the serving thread."""
 
-    reduce_done.synchronize()
-    dispatch_done.synchronize()
-    for events in lane_events:
-        events["return_done"].synchronize()
-    psums = dispatch.expert_psum.to(device="cpu", dtype=torch.int64).tolist()
-    outbound = _logical_outbound_dispatch(dispatch)
-    dispatch_ms = origin.elapsed_time(dispatch_done)
-    total_logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
-    lanes = []
-    for source_rank, (events, psum) in enumerate(zip(lane_events, psums)):
-        ready_ms = origin.elapsed_time(events["gemm_start"])
-        gemm_done_ms = origin.elapsed_time(events["gemm_done"])
-        return_start_ms = origin.elapsed_time(events["return_start"])
-        return_done_ms = origin.elapsed_time(events["return_done"])
-        lanes.append(
-            {
-                "source_rank": source_rank,
-                **_lane_layout_from_psum(psum),
-                "gemm_start_ms": ready_ms,
-                "gemm_done_ms": gemm_done_ms,
-                "gemm_ms": events["gemm_start"].elapsed_time(events["gemm_done"]),
-                "return_start_ms": return_start_ms,
-                "return_done_ms": return_done_ms,
-                "return_ms": events["return_start"].elapsed_time(
-                    events["return_done"]
+    defer_started_ns = time.monotonic_ns()
+    device = dispatch.x.device
+    lane_events = tuple(dict(events) for events in lane_events)
+    expert_psum = dispatch.expert_psum.detach()
+    source_topk_idx = dispatch.source_topk_idx.detach()
+    generation = dispatch.generation
+    input_tokens = source_topk_idx.size(0)
+    lane_count = dispatch.x.size(0)
+    local_experts = expert_psum.size(1)
+    lane_capacity_rows = dispatch.x.size(1)
+    hidden_bytes = dispatch.x.size(2) * dispatch.x.element_size()
+    route_metadata_bytes = source_topk_idx.size(1) * (
+        source_topk_idx.element_size()
+        + torch.tensor([], dtype=torch.float32).element_size()
+    )
+    context = dict(context)
+    defer_state = {"done_ns": None}
+
+    def collect() -> None:
+        collector_started_ns = time.monotonic_ns()
+        with torch.cuda.device(device):
+            reduce_done.synchronize()
+            dispatch_done.synchronize()
+            for events in lane_events:
+                events["return_done"].synchronize()
+            output_wait_done_ns = time.monotonic_ns()
+
+            profile_stream = torch.cuda.Stream(device=device, priority=0)
+            clock_anchor = torch.cuda.Event(enable_timing=True)
+            anchor_bracket_start_ns = time.monotonic_ns()
+            clock_anchor.record(profile_stream)
+            clock_anchor.synchronize()
+            anchor_bracket_end_ns = time.monotonic_ns()
+
+            psum_host = torch.empty(
+                expert_psum.shape,
+                dtype=expert_psum.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            topk_host = torch.empty(
+                source_topk_idx.shape,
+                dtype=source_topk_idx.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            metadata_done = torch.cuda.Event()
+            with torch.cuda.stream(profile_stream):
+                psum_host.copy_(expert_psum, non_blocking=True)
+                topk_host.copy_(source_topk_idx, non_blocking=True)
+                metadata_done.record(profile_stream)
+            metadata_done.synchronize()
+
+        anchor_midpoint_ns = (anchor_bracket_start_ns + anchor_bracket_end_ns) // 2
+
+        def aligned_timestamp(event: torch.cuda.Event) -> dict[str, float | int]:
+            rank_local_ms = origin.elapsed_time(event)
+            return {
+                "rank_local_ms": rank_local_ms,
+                "host_monotonic_ns_estimate": round(
+                    anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
                 ),
             }
+
+        psums = psum_host.to(dtype=torch.int64).tolist()
+        outbound = _logical_outbound_dispatch_from_host(
+            topk_host,
+            lane_count,
+            local_experts,
+            hidden_bytes,
+            route_metadata_bytes,
         )
-    payload = {
-        "schema": "sglang-deepep-streaming-timeline-v2",
-        **context,
-        "generation": dispatch.generation,
-        "input_tokens": dispatch.source_topk_idx.size(0),
-        "lane_capacity_rows": dispatch.x.size(1),
-        "dispatch": {
-            "transport_event_done_ms": dispatch_ms,
-            "logical_outbound_payload_bytes": total_logical_bytes,
-            "logical_outbound_gbps_at_transport_event": total_logical_bytes
-            / (dispatch_ms * 1e6),
-            "first_lane_consumer_visible_ms": min(
-                lane["gemm_start_ms"] for lane in lanes
-            ),
-            "all_lanes_consumer_visible_ms": max(
-                lane["gemm_start_ms"] for lane in lanes
-            ),
-            "destinations": outbound,
-        },
-        "lanes": lanes,
-        "combine_reduce": {
-            "start_ms": origin.elapsed_time(reduce_start),
-            "done_ms": origin.elapsed_time(reduce_done),
-            "elapsed_ms_including_return_wait": reduce_start.elapsed_time(reduce_done),
-        },
-    }
-    print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
+        dispatch_ms = origin.elapsed_time(dispatch_done)
+        total_logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+        lanes = []
+        lane_arrivals = []
+        for source_rank, (events, psum) in enumerate(zip(lane_events, psums)):
+            ready_ms = origin.elapsed_time(events["gemm_start"])
+            gemm_done_ms = origin.elapsed_time(events["gemm_done"])
+            return_start_ms = origin.elapsed_time(events["return_start"])
+            return_done_ms = origin.elapsed_time(events["return_done"])
+            lanes.append(
+                {
+                    "source_rank": source_rank,
+                    **_lane_layout_from_psum(psum),
+                    "gemm_start_ms": ready_ms,
+                    "gemm_done_ms": gemm_done_ms,
+                    "gemm_ms": events["gemm_start"].elapsed_time(events["gemm_done"]),
+                    "return_start_ms": return_start_ms,
+                    "return_done_ms": return_done_ms,
+                    "return_ms": events["return_start"].elapsed_time(
+                        events["return_done"]
+                    ),
+                }
+            )
+            lane_arrivals.append(
+                {
+                    "source_rank": source_rank,
+                    "gemm_start": aligned_timestamp(events["gemm_start"]),
+                    "gemm_done": aligned_timestamp(events["gemm_done"]),
+                    "return_start": aligned_timestamp(events["return_start"]),
+                    "return_done": aligned_timestamp(events["return_done"]),
+                }
+            )
+        collector_before_log_ns = time.monotonic_ns()
+        serving_done_ns = defer_state["done_ns"]
+        payload = {
+            "schema": "sglang-deepep-streaming-timeline-v3",
+            **context,
+            "generation": generation,
+            "input_tokens": input_tokens,
+            "lane_capacity_rows": lane_capacity_rows,
+            "profiler_overhead": {
+                "serving_thread_synchronized": False,
+                "serving_thread_defer_us": (
+                    (serving_done_ns - defer_started_ns) / 1e3
+                    if serving_done_ns is not None
+                    else None
+                ),
+                "collector_queue_delay_us": (collector_started_ns - defer_started_ns)
+                / 1e3,
+                "collector_wait_for_output_ms": (
+                    output_wait_done_ns - collector_started_ns
+                )
+                / 1e6,
+                "collector_before_log_ms": (
+                    collector_before_log_ns - collector_started_ns
+                )
+                / 1e6,
+                "metadata_d2h_bytes": (
+                    psum_host.numel() * psum_host.element_size()
+                    + topk_host.numel() * topk_host.element_size()
+                ),
+                "timed_cuda_event_count": 4 * len(lane_events) + 3,
+            },
+            "clock_alignment": {
+                "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
+                "anchor_bracket_start_ns": anchor_bracket_start_ns,
+                "anchor_bracket_end_ns": anchor_bracket_end_ns,
+                "uncertainty_ns": (anchor_bracket_end_ns - anchor_bracket_start_ns)
+                // 2,
+            },
+            "arrival_timestamps": {
+                "moe_entry": aligned_timestamp(origin),
+                "dispatch_transport_done": aligned_timestamp(dispatch_done),
+                "combine_reduce_start": aligned_timestamp(reduce_start),
+                "combine_reduce_done": aligned_timestamp(reduce_done),
+                "lanes": lane_arrivals,
+            },
+            "dispatch": {
+                "transport_event_done_ms": dispatch_ms,
+                "logical_outbound_payload_bytes": total_logical_bytes,
+                "logical_outbound_gbps_at_transport_event": total_logical_bytes
+                / (dispatch_ms * 1e6),
+                "first_lane_consumer_visible_ms": min(
+                    lane["gemm_start_ms"] for lane in lanes
+                ),
+                "all_lanes_consumer_visible_ms": max(
+                    lane["gemm_start_ms"] for lane in lanes
+                ),
+                "destinations": outbound,
+            },
+            "lanes": lanes,
+            "combine_reduce": {
+                "start_ms": origin.elapsed_time(reduce_start),
+                "done_ms": origin.elapsed_time(reduce_done),
+                "elapsed_ms_including_return_wait": reduce_start.elapsed_time(
+                    reduce_done
+                ),
+            },
+        }
+        print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
+
+    submit_moe_timeline_collection(collect)
+    defer_state["done_ns"] = time.monotonic_ns()
 
 
 def _launch_streaming_moe_lanes(
@@ -416,9 +536,7 @@ def _launch_streaming_moe_lanes(
     # Keeping it on the serving stream makes the next operation's dependency
     # ordinary CUDA stream order rather than an inter-rank synchronization.
     source_stream = torch.cuda.current_stream(dispatch.x.device)
-    reduce_start = (
-        torch.cuda.Event(enable_timing=True) if timeline_enabled else None
-    )
+    reduce_start = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
     reduce_done = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
     if reduce_start is not None:
         reduce_start.record(source_stream)

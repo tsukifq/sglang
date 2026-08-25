@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+from sglang.srt.layers.moe.profiling import record_moe_timeline_event
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import (
     ceil_div,
@@ -227,6 +228,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        record_moe_timeline_event("w13_done")
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -257,6 +259,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 swiglu_limit=swiglu_limit_arg,
                 swizzle=self.use_swizzle,
             )
+            record_moe_timeline_event("activation_done")
             del gateup_output
         else:
             # Hacky byte-equal fallback that reproduces the optimize-branch
@@ -289,6 +292,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+            record_moe_timeline_event("activation_done")
             del down_input
 
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
@@ -314,6 +318,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        record_moe_timeline_event("w2_done")
 
         return down_output
 
@@ -349,6 +354,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output,
             m_indices,
         )
+        record_moe_timeline_event("w13_done")
 
         dispose_tensor(hidden_states)
 
@@ -365,6 +371,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         else:
             down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+        record_moe_timeline_event("activation_done")
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
@@ -382,6 +389,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             m_indices,
         )
+        record_moe_timeline_event("w2_done")
 
         return down_output
 
