@@ -10,6 +10,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.profiling import (
+    get_active_moe_timeline,
+    record_moe_timeline_event,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -114,8 +118,11 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
+        timeline = get_active_moe_timeline()
         if self.fused_func is not None and not self.lora_enabled:
-            return self.fused_func(dispatch_output, quant_info, self.config)
+            output = self.fused_func(dispatch_output, quant_info, self.config)
+            record_moe_timeline_event("runner_fused_done")
+            return output
 
         assert self.runner_core is not None
 
@@ -154,6 +161,8 @@ class MoeRunner:
         )
 
         running_state = {}
+        if timeline is not None:
+            running_state["moe_timeline"] = timeline
         if self.down_gemm_overlap_args is not None:
             running_state["down_gemm_overlap_args"] = self.down_gemm_overlap_args
         if self.meta_overlap_args is not None:
@@ -162,6 +171,7 @@ class MoeRunner:
         runner_input = self.pre_permute_func(
             dispatch_output, quant_info, self.config, running_state
         )
+        record_moe_timeline_event("runner_pre_permute_done")
 
         hooks = _maybe_build_lora_hooks(runner_input)
 
@@ -176,6 +186,7 @@ class MoeRunner:
         combine_input = self.post_permute_func(
             runner_output, quant_info, self.config, running_state
         )
+        record_moe_timeline_event("runner_post_permute_done")
 
         return combine_input
 

@@ -20,6 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.profiling import (
+    get_active_moe_timeline,
+    record_moe_timeline_event,
+    record_moe_timeline_event_after_wait,
+)
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     DispatcherOutputDtype,
@@ -38,6 +43,21 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+
+
+def _record_dispatch_input_ready(buffer, dependency) -> bool:
+    """Timestamp comm-stream admission immediately before dispatch launch."""
+
+    timeline = get_active_moe_timeline()
+    if timeline is None or "dispatch_input_ready" not in timeline["events"]:
+        return False
+    if dependency is None:
+        raise ValueError(
+            "exact dispatch_input_ready requires DeepEP async dependency capture"
+        )
+    return record_moe_timeline_event_after_wait(
+        "dispatch_input_ready", buffer.get_comm_stream(), dependency
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -563,6 +583,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
+        # get_dispatch_layout returns its completion event. DeepEP's dispatch
+        # launch next waits on this same dependency on the same comm stream, so
+        # this event is the exact boundary at which dispatch can consume x.
+        _record_dispatch_input_ready(buffer, previous_event)
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -922,6 +946,7 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ) -> DispatchOutput:
         self.dispatch_a(hidden_states, topk_output)
+        record_moe_timeline_event("dispatch_prepare_done")
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
@@ -950,6 +975,7 @@ class DeepEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> torch.Tensor:
         self.combine_a(combine_input)
+        record_moe_timeline_event("combine_prepare_done")
         ret = self.combine_b()
         return ret
 

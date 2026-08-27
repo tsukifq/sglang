@@ -33,6 +33,11 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
 )
+from sglang.srt.layers.moe.profiling import (
+    moe_timeline_scope,
+    record_moe_timeline_event,
+)
+from sglang.srt.layers.moe.staged_profiling import StagedMoeProfiler
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
@@ -356,6 +361,14 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        staged_profiler = StagedMoeProfiler(
+            rank=self.moe_ep_rank,
+            layer_id=self.layer_id,
+            deepep_enabled=get_moe_a2a_backend().is_deepep(),
+        )
+        self._staged_moe_profiler = (
+            staged_profiler if staged_profiler.selected_layer else None
+        )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
@@ -1278,23 +1291,53 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        profiler = self._staged_moe_profiler
+        sample = profiler.begin(hidden_states) if profiler is not None else None
+        if sample is None:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
 
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+                # TODO: should we add some conditions here?
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
+        else:
+            with moe_timeline_scope(sample["timeline"]):
+                dispatch_output = self.dispatcher.dispatch(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+                record_moe_timeline_event("dispatch_done")
+
+                combine_input = self.run_moe_core(
+                    dispatch_output=dispatch_output,
+                )
+                record_moe_timeline_event("gemm_done")
+
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    final_hidden_states = self.dispatcher.combine(
+                        combine_input=combine_input
+                    )
+                    record_moe_timeline_event("combine_done")
+                    final_hidden_states = final_hidden_states[
+                        ..., :origin_hidden_states_dim
+                    ].contiguous()
+                    record_moe_timeline_event("output_ready")
+
+            profiler.submit(sample)
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
