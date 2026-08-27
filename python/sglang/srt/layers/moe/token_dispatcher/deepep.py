@@ -20,7 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.profiling import record_moe_timeline_event
+from sglang.srt.layers.moe.profiling import (
+    get_active_moe_timeline,
+    record_moe_timeline_event,
+    record_moe_timeline_event_after_wait,
+)
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     DispatcherOutputDtype,
@@ -40,6 +44,22 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 ElasticBuffer = None
+
+
+def _record_dispatch_input_ready(buffer, dependency) -> bool:
+    """Timestamp DeepEP comm-stream admission for a selected profile sample."""
+
+    timeline = get_active_moe_timeline()
+    if timeline is None or "dispatch_input_ready" not in timeline["events"]:
+        return False
+    if dependency is None:
+        raise ValueError(
+            "exact dispatch_input_ready requires DeepEP async dependency capture"
+        )
+    return record_moe_timeline_event_after_wait(
+        "dispatch_input_ready", buffer.get_comm_stream(), dependency
+    )
+
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -653,6 +673,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.use_fp8,
         )
         previous_event = ElasticBuffer.capture()
+        _record_dispatch_input_ready(buffer, previous_event)
         (
             _recv_x,
             _recv_topk_ids,
@@ -675,12 +696,23 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             do_zero_padding=False,
             use_tma_aligned_col_major_sf=self.use_fp8 and use_tma_aligned_scales,
         )
+        timeline = get_active_moe_timeline()
+        profile_events = (
+            {
+                name: event
+                for name, event in timeline["events"].items()
+                if name in timeline["recorded"]
+            }
+            if timeline is not None
+            else None
+        )
         return DeepEPStreamingDispatch.from_runtime(
             buffer=buffer,
             raw=buffer.get_streaming_lane_view(),
             source_topk_idx=topk_ids,
             transport_handle=transport_handle,
             transport_event=transport_event,
+            profile_events=profile_events,
         )
 
     def _dispatch_core(
@@ -704,6 +736,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
+        _record_dispatch_input_ready(buffer, previous_event)
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.

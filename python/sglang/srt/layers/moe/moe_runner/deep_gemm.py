@@ -23,7 +23,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.profiling import record_moe_timeline_event
+from sglang.srt.layers.moe.profiling import (
+    get_active_moe_timeline,
+    record_moe_timeline_counter,
+    record_moe_timeline_event,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import (
     ceil_div,
@@ -65,6 +69,44 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+
+
+def _record_contiguous_grouped_gemm_work(
+    running_state: dict, *, gate_up_width: int, hidden_size: int, dtype: torch.dtype
+) -> None:
+    """Record useful grouped-GEMM work without a device-to-host readback."""
+
+    if get_active_moe_timeline() is None:
+        return
+    rows = int(running_state["all_tokens"])
+    expert_rows = [
+        int(value) for value in running_state.get("expert_rows", ())
+    ]
+    w13_flops = 2 * rows * gate_up_width * hidden_size
+    w2_flops = 2 * rows * (gate_up_width // 2) * hidden_size
+    record_moe_timeline_counter(
+        "deep_gemm",
+        {
+            "layout": "contiguous",
+            "dtype": str(dtype),
+            "expert_rows": expert_rows,
+            "rows": rows,
+            "nonempty_experts": sum(value > 0 for value in expert_rows),
+            "w13": {
+                "m": rows,
+                "n": gate_up_width,
+                "k": hidden_size,
+                "useful_flops": w13_flops,
+            },
+            "w2": {
+                "m": rows,
+                "n": hidden_size,
+                "k": gate_up_width // 2,
+                "useful_flops": w2_flops,
+            },
+            "useful_flops": w13_flops + w2_flops,
+        },
+    )
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -220,6 +262,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
+        _record_contiguous_grouped_gemm_work(
+            running_state,
+            gate_up_width=N,
+            hidden_size=K,
+            dtype=quant_info.w13_weight.dtype,
+        )
+        record_moe_timeline_event("w13_start")
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
@@ -249,6 +298,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+            record_moe_timeline_event("activation_start")
             silu_and_mul_contig_post_quant(
                 input=gateup_output,
                 output=down_input_fp8,
@@ -274,6 +324,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     gateup_output, swiglu_limit=self.swiglu_limit
                 )
 
+            record_moe_timeline_event("activation_start")
             if not _is_musa:
                 down_input = torch.empty(
                     (all_tokens, N // 2),
@@ -310,6 +361,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
+        record_moe_timeline_event("w2_start")
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
@@ -348,6 +400,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
 
+        _record_contiguous_grouped_gemm_work(
+            running_state,
+            gate_up_width=N,
+            hidden_size=K,
+            dtype=quant_info.w13_weight.dtype,
+        )
+        record_moe_timeline_event("w13_start")
         deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             hidden_states,
             w13_weight,
@@ -359,6 +418,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
 
         # Act: (M, N) -> (M, N/2)
+        record_moe_timeline_event("activation_start")
         if not _is_musa:
             down_input = torch.empty(
                 (
@@ -383,6 +443,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
+        record_moe_timeline_event("w2_start")
         deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
             down_input,
             w2_weight,
@@ -456,6 +517,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+        record_moe_timeline_event("w13_start")
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
@@ -465,6 +527,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        record_moe_timeline_event("w13_done")
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -506,6 +569,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             else None
         )
+        record_moe_timeline_event("activation_start")
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
@@ -517,6 +581,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gemm1_clamp_limit=self.config.gemm1_clamp_limit,
             num_real_tokens=num_real_tokens,
         )
+        record_moe_timeline_event("activation_done")
         del gateup_output
 
         # Down activation is quantised locally at scale_block_size (never DeepEP-LL),
@@ -565,6 +630,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
+        record_moe_timeline_event("w2_start")
         deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
@@ -575,6 +641,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
             **gemm_overlap_args_dict,
         )
+        record_moe_timeline_event("w2_done")
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
@@ -609,6 +676,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+        record_moe_timeline_event("w13_start")
         deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
             hidden_states,
             w13_weight,
@@ -616,6 +684,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
         )
+        record_moe_timeline_event("w13_done")
         dispose_tensor(hidden_states)
 
         down_input = torch.empty(
@@ -629,7 +698,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         # Act
+        record_moe_timeline_event("activation_start")
         silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        record_moe_timeline_event("activation_done")
         del gateup_output
 
         # GroupGemm-1
@@ -641,6 +712,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output = torch.empty(
                 (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
             )
+        record_moe_timeline_event("w2_start")
         deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
             down_input,
             w2_weight,
@@ -648,6 +720,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
         )
+        record_moe_timeline_event("w2_done")
         # Note: BF16 masked gemm doesn't support overlap_args, so no return value unpack
 
         return down_output
@@ -825,6 +898,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
+    running_state["expert_rows"] = list(num_recv_tokens_per_expert)
 
     K = hidden_states.shape[1]
 

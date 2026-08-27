@@ -19,6 +19,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.profiling import (
+    build_moe_component_profile,
+    canonical_moe_profile_detail,
     cuda_event_host_interval,
     submit_moe_timeline_collection,
 )
@@ -77,6 +79,7 @@ class DeepEPStreamingDispatch:
     source_topk_idx: torch.Tensor
     transport_handle: Any
     transport_event: Any
+    profile_events: dict[str, torch.cuda.Event] | None = None
 
     @classmethod
     def from_runtime(
@@ -87,6 +90,7 @@ class DeepEPStreamingDispatch:
         source_topk_idx: torch.Tensor,
         transport_handle: Any,
         transport_event: Any,
+        profile_events: dict[str, torch.cuda.Event] | None = None,
     ) -> "DeepEPStreamingDispatch":
         if len(raw) != 7:
             raise ValueError(f"expected seven DeepEP lane-view fields, got {len(raw)}")
@@ -96,6 +100,7 @@ class DeepEPStreamingDispatch:
             source_topk_idx,
             transport_handle,
             transport_event,
+            dict(profile_events or {}),
         )
         view.validate()
         return view
@@ -355,6 +360,122 @@ def _emit_streaming_timeline(
                     "return_done": aligned_timestamp(events["return_done"]),
                 }
             )
+        first_compute_lane = min(
+            range(len(lanes)), key=lambda lane: lanes[lane]["gemm_start_ms"]
+        )
+        last_compute_lane = max(
+            range(len(lanes)), key=lambda lane: lanes[lane]["gemm_done_ms"]
+        )
+        first_combine_lane = min(
+            range(len(lanes)), key=lambda lane: lanes[lane]["return_start_ms"]
+        )
+        first_consumer_lane = min(
+            range(len(lanes)), key=lambda lane: lanes[lane]["gemm_start_ms"]
+        )
+        last_consumer_lane = max(
+            range(len(lanes)), key=lambda lane: lanes[lane]["gemm_start_ms"]
+        )
+        layer_entry = aligned_timestamp(origin)
+        dispatch_transport_done = aligned_timestamp(dispatch_done)
+        combine_all_done = aligned_timestamp(reduce_done)
+        profile_events = dispatch.profile_events or {}
+        dispatch_input_ready = (
+            aligned_timestamp(profile_events["dispatch_input_ready"])
+            if "dispatch_input_ready" in profile_events
+            else None
+        )
+        canonical_detail = canonical_moe_profile_detail(
+            context["profile_detail"], "streaming"
+        )
+        component_items = []
+        if canonical_detail in ("lane", "hardware"):
+            component_items = [
+                {
+                    "kind": "source_lane",
+                    "id": str(lane["source_rank"]),
+                    "events": {
+                        "dispatch_consumer_start": arrival["gemm_start"],
+                        "compute_start": arrival["gemm_start"],
+                        "compute_done": arrival["gemm_done"],
+                        "combine_start": arrival["return_start"],
+                        "combine_done": arrival["return_done"],
+                    },
+                    "counters": {
+                        "useful_rows": lane["useful_rows"],
+                        "active_span_rows": lane["active_span_rows"],
+                        "alignment_hole_rows": lane["alignment_hole_rows"],
+                        "nonempty_experts": lane["nonempty_experts"],
+                    },
+                }
+                for lane, arrival in zip(lanes, lane_arrivals)
+            ]
+        component_events = {
+            "layer_entry": layer_entry,
+            "dispatch_transport_done": dispatch_transport_done,
+            # A lane event is recorded after its device doorbell wait and
+            # immediately before GEMM. It is a consumer-start observation,
+            # not an exact DeepEP publication timestamp.
+            "dispatch_first_consumer_start": lane_arrivals[first_consumer_lane][
+                "gemm_start"
+            ],
+            "dispatch_all_consumer_start": lane_arrivals[last_consumer_lane][
+                "gemm_start"
+            ],
+            "compute_first_start": lane_arrivals[first_compute_lane]["gemm_start"],
+            "compute_all_done": lane_arrivals[last_compute_lane]["gemm_done"],
+            "combine_first_start": lane_arrivals[first_combine_lane][
+                "return_start"
+            ],
+            "combine_all_done": combine_all_done,
+            "layer_output_ready": combine_all_done,
+        }
+        component_provenance = {
+            "layer_entry": "sglang_caller_stream",
+            "dispatch_transport_done": "deepep_transport_completion_event",
+            "dispatch_first_consumer_start": (
+                "lane_stream_after_deepep_doorbell_wait_proxy"
+            ),
+            "dispatch_all_consumer_start": (
+                "lane_stream_after_deepep_doorbell_wait_proxy"
+            ),
+            "compute_first_start": "lane_compute_stream",
+            "compute_all_done": "lane_compute_stream",
+            "combine_first_start": "lane_return_stream",
+            "combine_all_done": "source_reduce_stream",
+            "layer_output_ready": "source_reduce_stream",
+        }
+        if dispatch_input_ready is not None:
+            component_events["dispatch_input_ready"] = dispatch_input_ready
+            component_provenance["dispatch_input_ready"] = (
+                "deepep_comm_stream_after_input_dependency_wait"
+            )
+        component_profile = build_moe_component_profile(
+            execution_model="streaming",
+            detail=context["profile_detail"],
+            events=component_events,
+            event_provenance=component_provenance,
+            counters={
+                "input_tokens": input_tokens,
+                "dispatch": {
+                    "logical_outbound_payload_bytes": total_logical_bytes,
+                    "lane_capacity_rows": lane_capacity_rows,
+                },
+                "compute": {
+                    "useful_rows": sum(lane["useful_rows"] for lane in lanes),
+                    "active_span_rows": sum(
+                        lane["active_span_rows"] for lane in lanes
+                    ),
+                    "nonempty_experts": sum(
+                        lane["nonempty_experts"] for lane in lanes
+                    ),
+                },
+            },
+            items=component_items,
+            capabilities={
+                "exact_dispatch_input_ready": dispatch_input_ready is not None,
+                "exact_dispatch_output_ready": False,
+            },
+        )
         collector_before_log_ns = time.monotonic_ns()
         serving_done_ns = defer_state["done_ns"]
         payload = {
@@ -384,7 +505,9 @@ def _emit_streaming_timeline(
                     psum_host.numel() * psum_host.element_size()
                     + topk_host.numel() * topk_host.element_size()
                 ),
-                "timed_cuda_event_count": 4 * len(lane_events) + 3,
+                "timed_cuda_event_count": (
+                    4 * len(lane_events) + 3 + len(profile_events)
+                ),
             },
             "clock_alignment": {
                 "method": (
@@ -404,10 +527,15 @@ def _emit_streaming_timeline(
                 ),
             },
             "arrival_timestamps": {
-                "moe_entry": aligned_timestamp(origin),
-                "dispatch_transport_done": aligned_timestamp(dispatch_done),
+                "moe_entry": layer_entry,
+                **(
+                    {"dispatch_input_ready": dispatch_input_ready}
+                    if dispatch_input_ready is not None
+                    else {}
+                ),
+                "dispatch_transport_done": dispatch_transport_done,
                 "combine_reduce_start": aligned_timestamp(reduce_start),
-                "combine_reduce_done": aligned_timestamp(reduce_done),
+                "combine_reduce_done": combine_all_done,
                 "lanes": lane_arrivals,
             },
             "dispatch": {
@@ -431,6 +559,7 @@ def _emit_streaming_timeline(
                     reduce_done
                 ),
             },
+            "component_profile": component_profile,
         }
         print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
 

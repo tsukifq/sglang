@@ -42,6 +42,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.profiling import (
+    build_moe_component_profile,
     calibrated_event_timing_guard_ns,
     cuda_event_host_interval,
     ensure_moe_timeline_collector,
@@ -628,12 +629,15 @@ class FusedMoE(torch.nn.Module):
         origin: torch.cuda.Event,
         output_ready: torch.cuda.Event,
         hidden_states: torch.Tensor,
+        timeline: dict,
     ) -> None:
         """Queue a minimal cross-rank MoE-entry sample off the serving thread."""
 
         defer_started_ns = time.monotonic_ns()
         device = hidden_states.device
         input_tokens = hidden_states.size(0)
+        events = dict(timeline["events"])
+        recorded = frozenset(timeline["recorded"])
         context = dict(context)
         defer_state = {"done_ns": None}
 
@@ -654,18 +658,56 @@ class FusedMoE(torch.nn.Module):
             ) // 2
 
             def aligned_timestamp(event: torch.cuda.Event) -> dict:
-                return cuda_event_host_interval(
-                    event,
-                    clock_anchor,
-                    anchor_bracket_start_ns=anchor_bracket_start_ns,
-                    anchor_bracket_end_ns=anchor_bracket_end_ns,
-                    event_timing_guard_ns=int(
-                        context["clock_contract"]["event_timing_guard_ns"]
+                return {
+                    "rank_local_ms": origin.elapsed_time(event),
+                    **cuda_event_host_interval(
+                        event,
+                        clock_anchor,
+                        anchor_bracket_start_ns=anchor_bracket_start_ns,
+                        anchor_bracket_end_ns=anchor_bracket_end_ns,
+                        event_timing_guard_ns=int(
+                            context["clock_contract"]["event_timing_guard_ns"]
+                        ),
                     ),
-                )
+                }
 
             collector_before_log_ns = time.monotonic_ns()
             serving_done_ns = defer_state["done_ns"]
+            arrival_timestamps = {
+                "moe_entry": aligned_timestamp(origin),
+                "output_ready": aligned_timestamp(output_ready),
+            }
+            arrival_timestamps.update(
+                {name: aligned_timestamp(events[name]) for name in sorted(recorded)}
+            )
+            component_events = {
+                "layer_entry": arrival_timestamps["moe_entry"],
+                "layer_output_ready": arrival_timestamps["output_ready"],
+            }
+            component_provenance = {
+                "layer_entry": "sglang_caller_stream",
+                "layer_output_ready": "sglang_caller_stream",
+            }
+            if "dispatch_input_ready" in recorded:
+                component_events["dispatch_input_ready"] = arrival_timestamps[
+                    "dispatch_input_ready"
+                ]
+                component_provenance["dispatch_input_ready"] = (
+                    "deepep_comm_stream_after_input_dependency_wait"
+                )
+            component_profile = build_moe_component_profile(
+                execution_model="staged",
+                detail=context["profile_detail"],
+                events=component_events,
+                event_provenance=component_provenance,
+                counters={"input_tokens": input_tokens},
+                capabilities={
+                    "exact_dispatch_input_ready": (
+                        "dispatch_input_ready" in recorded
+                    ),
+                    "exact_dispatch_output_ready": False,
+                },
+            )
             payload = {
                 "schema": "sglang-deepep-arrival-timeline-v2",
                 **context,
@@ -690,7 +732,7 @@ class FusedMoE(torch.nn.Module):
                     )
                     / 1e6,
                     "metadata_d2h_bytes": 0,
-                    "timed_cuda_event_count": 2,
+                    "timed_cuda_event_count": len(recorded) + 1,
                 },
                 "clock_alignment": {
                     "method": (
@@ -709,10 +751,8 @@ class FusedMoE(torch.nn.Module):
                         context["clock_contract"]["event_timing_guard_ns"]
                     ),
                 },
-                "arrival_timestamps": {
-                    "moe_entry": aligned_timestamp(origin),
-                    "output_ready": aligned_timestamp(output_ready),
-                },
+                "arrival_timestamps": arrival_timestamps,
+                "component_profile": component_profile,
             }
             print("DEEPEP_ARRIVAL_TIMELINE " + json.dumps(payload), flush=True)
 
@@ -762,6 +802,7 @@ class FusedMoE(torch.nn.Module):
         defer_started_ns = time.monotonic_ns()
         events = dict(timeline["events"])
         recorded = frozenset(timeline["recorded"])
+        timeline_counters = dict(timeline.get("counters", {}))
         output_ready = events["output_ready"]
         device = hidden_states.device
         input_tokens = hidden_states.size(0)
@@ -863,8 +904,11 @@ class FusedMoE(torch.nn.Module):
                 "dispatch_prepare_done",
                 "dispatch_done",
                 "runner_pre_permute_done",
+                "w13_start",
                 "w13_done",
+                "activation_start",
                 "activation_done",
+                "w2_start",
                 "w2_done",
                 "runner_post_permute_done",
                 "gemm_done",
@@ -892,13 +936,24 @@ class FusedMoE(torch.nn.Module):
                     "runner_pre_permute_ms": interval(
                         dispatch_done, events["runner_pre_permute_done"]
                     ),
+                    "w13_launch_gap_ms": interval(
+                        events["runner_pre_permute_done"], events["w13_start"]
+                    ),
                     "w13_ms": interval(
-                        events["runner_pre_permute_done"], events["w13_done"]
+                        events["w13_start"], events["w13_done"]
+                    ),
+                    "activation_launch_gap_ms": interval(
+                        events["w13_done"], events["activation_start"]
                     ),
                     "activation_ms": interval(
-                        events["w13_done"], events["activation_done"]
+                        events["activation_start"], events["activation_done"]
                     ),
-                    "w2_ms": interval(events["activation_done"], events["w2_done"]),
+                    "w2_launch_gap_ms": interval(
+                        events["activation_done"], events["w2_start"]
+                    ),
+                    "w2_ms": interval(
+                        events["w2_start"], events["w2_done"]
+                    ),
                     "runner_post_permute_ms": interval(
                         events["w2_done"], events["runner_post_permute_done"]
                     ),
@@ -923,6 +978,135 @@ class FusedMoE(torch.nn.Module):
                         },
                     }
                 )
+            deep_gemm_profile = None
+            deep_gemm_work = timeline_counters.get("deep_gemm")
+            if deep_gemm_work is not None and {
+                "w13_start",
+                "w13_done",
+                "w2_start",
+                "w2_done",
+            }.issubset(recorded):
+                deep_gemm_profile = dict(deep_gemm_work)
+                w13_ms = events["w13_start"].elapsed_time(events["w13_done"])
+                w2_ms = events["w2_start"].elapsed_time(events["w2_done"])
+                gemm_ms = w13_ms + w2_ms
+                deep_gemm_profile["measured"] = {
+                    "w13_ms": w13_ms,
+                    "w13_useful_tflops": (
+                        deep_gemm_work["w13"]["useful_flops"] / (w13_ms * 1e9)
+                        if w13_ms > 0
+                        else None
+                    ),
+                    "w2_ms": w2_ms,
+                    "w2_useful_tflops": (
+                        deep_gemm_work["w2"]["useful_flops"] / (w2_ms * 1e9)
+                        if w2_ms > 0
+                        else None
+                    ),
+                    "gemm_ms": gemm_ms,
+                    "gemm_useful_tflops": (
+                        deep_gemm_work["useful_flops"] / (gemm_ms * 1e9)
+                        if gemm_ms > 0
+                        else None
+                    ),
+                }
+            component_events = {
+                "layer_entry": arrival_timestamps["moe_entry"],
+                # dispatch_done executes on the consumer stream after
+                # DeepEP's completion dependency has been satisfied. In
+                # the staged adapter first/all readiness collapse.
+                "dispatch_first_output_ready": arrival_timestamps[
+                    "dispatch_done"
+                ],
+                "dispatch_all_output_ready": arrival_timestamps[
+                    "dispatch_done"
+                ],
+                "compute_first_start": arrival_timestamps["dispatch_done"],
+                "compute_all_done": arrival_timestamps["gemm_done"],
+                "combine_first_start": arrival_timestamps["gemm_done"],
+                "combine_all_done": arrival_timestamps["combine_done"],
+                "layer_output_ready": arrival_timestamps["output_ready"],
+            }
+            component_provenance = {
+                "layer_entry": "sglang_caller_stream",
+                "dispatch_first_output_ready": (
+                    "consumer_stream_after_deepep_completion_wait"
+                ),
+                "dispatch_all_output_ready": (
+                    "consumer_stream_after_deepep_completion_wait"
+                ),
+                "compute_first_start": "sglang_caller_stream_boundary",
+                "compute_all_done": "sglang_caller_stream_boundary",
+                "combine_first_start": "sglang_caller_stream_boundary",
+                "combine_all_done": (
+                    "consumer_stream_after_deepep_completion_wait"
+                ),
+                "layer_output_ready": "sglang_caller_stream",
+            }
+            if "dispatch_input_ready" in recorded:
+                component_events["dispatch_input_ready"] = arrival_timestamps[
+                    "dispatch_input_ready"
+                ]
+                component_provenance["dispatch_input_ready"] = (
+                    "deepep_comm_stream_after_input_dependency_wait"
+                )
+            component_profile = build_moe_component_profile(
+                execution_model="staged",
+                detail=context["profile_detail"],
+                events=component_events,
+                event_provenance=component_provenance,
+                counters={
+                    "input_tokens": input_tokens,
+                    "dispatch": {
+                        "logical_outbound_payload_bytes": logical_bytes,
+                        "received_buffer_rows": dispatch_buffer_rows,
+                    },
+                    "compute": {
+                        "runner_rows": sum(runner_rows),
+                        "nonempty_experts": sum(row > 0 for row in runner_rows),
+                        "deep_gemm": deep_gemm_profile,
+                    },
+                },
+                items=(
+                    [
+                        {
+                            "kind": "grouped_gemm",
+                            "id": name,
+                            "events": {
+                                "start": arrival_timestamps[f"{name}_start"],
+                                "done": arrival_timestamps[f"{name}_done"],
+                            },
+                            "counters": deep_gemm_work[name],
+                        }
+                        for name in ("w13", "w2")
+                    ]
+                    if deep_gemm_profile is not None
+                    else []
+                )
+                + [
+                    {
+                        "kind": "rank_batch",
+                        "id": str(context["rank"]),
+                        "events": {
+                            "dispatch_output_ready_ms": dispatch_ms,
+                            "compute_done_ms": origin.elapsed_time(gemm_done),
+                            "combine_done_ms": origin.elapsed_time(combine_done),
+                        },
+                        "counters": {
+                            "runner_rows": sum(runner_rows),
+                            "nonempty_experts": sum(
+                                row > 0 for row in runner_rows
+                            ),
+                        },
+                    }
+                ],
+                capabilities={
+                    "exact_dispatch_input_ready": (
+                        "dispatch_input_ready" in recorded
+                    ),
+                    "exact_dispatch_output_ready": True,
+                },
+            )
             collector_before_log_ns = time.monotonic_ns()
             serving_done_ns = defer_state["done_ns"]
             payload = {
@@ -995,6 +1179,7 @@ class FusedMoE(torch.nn.Module):
                 "output_finalize_ms": combine_done.elapsed_time(output_ready),
                 "total_ms": origin.elapsed_time(output_ready),
                 "breakdown": breakdown,
+                "component_profile": component_profile,
             }
             print("DEEPEP_BASELINE_TIMELINE " + json.dumps(payload), flush=True)
 
@@ -1018,14 +1203,23 @@ class FusedMoE(torch.nn.Module):
             self._deepep_streaming_drain_stream = torch.cuda.Stream(priority=0)
 
         timeline_origin = None
+        dispatch_timeline = None
         if timeline_context is not None:
             timeline_origin = torch.cuda.Event(enable_timing=True)
             timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
+            dispatch_timeline = {
+                "events": {
+                    "dispatch_input_ready": torch.cuda.Event(enable_timing=True)
+                },
+                "recorded": set(),
+                "counters": {},
+            }
 
-        dispatch = self.dispatcher.dispatch_streaming(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        with moe_timeline_scope(dispatch_timeline):
+            dispatch = self.dispatcher.dispatch_streaming(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
         if self._deepep_streaming_fp8:
             result = launch_fp8_streaming_moe(
                 dispatch,
@@ -1955,14 +2149,18 @@ class FusedMoE(torch.nn.Module):
         else:
             timeline_origin = torch.cuda.Event(enable_timing=True)
             event_names = (
-                ("output_ready",)
+                ("dispatch_input_ready", "output_ready")
                 if timeline_context["profile_detail"] == "arrival"
                 else (
+                    "dispatch_input_ready",
                     "dispatch_prepare_done",
                     "dispatch_done",
                     "runner_pre_permute_done",
+                    "w13_start",
                     "w13_done",
+                    "activation_start",
                     "activation_done",
+                    "w2_start",
                     "w2_done",
                     "runner_post_permute_done",
                     "runner_fused_done",
@@ -1977,6 +2175,7 @@ class FusedMoE(torch.nn.Module):
                     name: torch.cuda.Event(enable_timing=True) for name in event_names
                 },
                 "recorded": set(),
+                "counters": {},
             }
             timeline_origin.record(torch.cuda.current_stream(hidden_states.device))
             with moe_timeline_scope(timeline):
@@ -2011,6 +2210,7 @@ class FusedMoE(torch.nn.Module):
                     timeline_origin,
                     timeline["events"]["output_ready"],
                     hidden_states,
+                    timeline,
                 )
             else:
                 self._emit_baseline_timeline(
