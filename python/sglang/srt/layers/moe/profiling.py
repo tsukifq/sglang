@@ -476,3 +476,28 @@ def record_moe_timeline_event_after_wait(
         event.record(stream)
     state["recorded"].add(name)
     return True
+
+
+# Async_MoE keeps the component-neutral implementation outside SGLang so the
+# standalone DeepEP/DeepGEMM qualification and the serving adapter execute the
+# same code. The definitions above remain an upstream-friendly fallback when
+# SGLang is used outside the parent project checkout.
+try:
+    from profiler.moe_timeline import (  # noqa: E402,F401
+        MOE_COMPONENT_PROFILE_SCHEMA,
+        build_moe_component_profile,
+        calibrated_event_timing_guard_ns,
+        canonical_moe_profile_detail,
+        cuda_event_host_interval,
+        ensure_moe_timeline_collector,
+        get_active_moe_timeline,
+        host_clock_domain_id,
+        moe_timeline_scope,
+        record_moe_timeline_counter,
+        record_moe_timeline_event,
+        record_moe_timeline_event_after_wait,
+        submit_moe_timeline_collection,
+    )
+except ModuleNotFoundError as error:
+    if error.name not in ("profiler", "profiler.moe_timeline"):
+        raise
