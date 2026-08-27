@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import os
 import queue
+import socket
 import threading
 import traceback
 from typing import Any, Callable, Iterator, Optional
@@ -21,6 +22,50 @@ _ACTIVE_MOE_TIMELINE: ContextVar[Optional[dict[str, Any]]] = ContextVar(
 )
 _COLLECTOR_LOCK = threading.Lock()
 _COLLECTOR_QUEUE: Optional[queue.Queue[Callable[[], None]]] = None
+
+
+def host_clock_domain_id() -> str:
+    """Identify the kernel clock domain backing ``CLOCK_MONOTONIC``."""
+
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as source:
+            boot_id = source.read().strip()
+    except OSError:
+        boot_id = "unknown-boot"
+    return f"{socket.gethostname()}:{boot_id}"
+
+
+def cuda_event_host_interval(
+    event: Any,
+    anchor: Any,
+    *,
+    anchor_bracket_start_ns: int,
+    anchor_bracket_end_ns: int,
+    event_timing_guard_ns: int,
+) -> dict[str, int]:
+    """Project a CUDA event to a conservative host-monotonic interval.
+
+    The anchor event executes after ``anchor_bracket_start_ns`` and before
+    ``anchor_bracket_end_ns``. CUDA elapsed time places ``event`` before that
+    unknown anchor instant. ``event_timing_guard_ns`` covers calibrated CUDA
+    event quantization and projection residual rather than pretending the
+    bracket midpoint is an exact cross-device timestamp.
+    """
+
+    if anchor_bracket_end_ns < anchor_bracket_start_ns:
+        raise ValueError("CUDA anchor bracket end precedes its start")
+    if event_timing_guard_ns < 0:
+        raise ValueError("CUDA event timing guard must be nonnegative")
+    delta_ns = round(event.elapsed_time(anchor) * 1e6)
+    if delta_ns < 0:
+        raise ValueError("profiled CUDA event executes after its clock anchor")
+    lower_ns = anchor_bracket_start_ns - delta_ns - event_timing_guard_ns
+    upper_ns = anchor_bracket_end_ns - delta_ns + event_timing_guard_ns
+    return {
+        "host_monotonic_ns_estimate": (lower_ns + upper_ns) // 2,
+        "host_monotonic_ns_lower": lower_ns,
+        "host_monotonic_ns_upper": upper_ns,
+    }
 
 
 def _collector_main(work_queue: queue.Queue[Callable[[], None]]) -> None:

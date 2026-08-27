@@ -42,7 +42,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.profiling import (
+    cuda_event_host_interval,
     ensure_moe_timeline_collector,
+    host_clock_domain_id,
     moe_timeline_scope,
     record_moe_timeline_event,
     submit_moe_timeline_collection,
@@ -390,6 +392,9 @@ class FusedMoE(torch.nn.Module):
         self._deepep_timeline_call_offset = 0
         self._deepep_timeline_detail = "full"
         self._deepep_timeline_enable_file = ""
+        self._deepep_timeline_run_id = ""
+        self._deepep_timeline_event_guard_ns = 1000
+        self._deepep_timeline_clock_domain = ""
         self._deepep_timeline_layer_weight = 1
         self._deepep_timeline_selected_layer = False
         timeline_enabled = os.getenv("SGLANG_DEEPEP_TIMELINE", "0").lower()
@@ -438,6 +443,29 @@ class FusedMoE(torch.nn.Module):
             self._deepep_timeline_enable_file = os.getenv(
                 "SGLANG_DEEPEP_TIMELINE_ENABLE_FILE", ""
             ).strip()
+            self._deepep_timeline_run_id = os.getenv(
+                "SGLANG_DEEPEP_TIMELINE_RUN_ID", ""
+            ).strip()
+            try:
+                self._deepep_timeline_event_guard_ns = int(
+                    os.getenv("SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS", "1000")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS must be an integer"
+                ) from error
+            if self._deepep_timeline_event_guard_ns < 0:
+                raise ValueError(
+                    "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS must be nonnegative"
+                )
+            if (
+                self._deepep_timeline_detail == "arrival"
+                and not self._deepep_timeline_run_id
+            ):
+                raise ValueError(
+                    "SGLANG_DEEPEP_TIMELINE_RUN_ID is required for arrival profiling"
+                )
+            self._deepep_timeline_clock_domain = host_clock_domain_id()
             self._deepep_timeline_selected_layer = (
                 get_moe_a2a_backend().is_deepep() and self.layer_id in target_layers
             )
@@ -586,10 +614,19 @@ class FusedMoE(torch.nn.Module):
             "call_index": call_index,
             "mode": mode,
             "profile_detail": self._deepep_timeline_detail,
+            "run_id": self._deepep_timeline_run_id or None,
+            "sample_id": (
+                f"{self._deepep_timeline_run_id}:{mode}:"
+                f"layer={self.layer_id}:call={call_index}"
+            ),
+            "host_clock_domain_id": self._deepep_timeline_clock_domain,
             "sampling": {
                 "call_stride": self._deepep_timeline_call_stride or 1,
                 "call_offset": self._deepep_timeline_call_offset,
                 "layer_weight": self._deepep_timeline_layer_weight,
+            },
+            "clock_contract": {
+                "event_timing_guard_ns": self._deepep_timeline_event_guard_ns,
             },
         }
 
@@ -625,16 +662,20 @@ class FusedMoE(torch.nn.Module):
             ) // 2
 
             def aligned_timestamp(event: torch.cuda.Event) -> dict:
-                return {
-                    "host_monotonic_ns_estimate": round(
-                        anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
-                    )
-                }
+                return cuda_event_host_interval(
+                    event,
+                    clock_anchor,
+                    anchor_bracket_start_ns=anchor_bracket_start_ns,
+                    anchor_bracket_end_ns=anchor_bracket_end_ns,
+                    event_timing_guard_ns=int(
+                        context["clock_contract"]["event_timing_guard_ns"]
+                    ),
+                )
 
             collector_before_log_ns = time.monotonic_ns()
             serving_done_ns = defer_state["done_ns"]
             payload = {
-                "schema": "sglang-deepep-arrival-timeline-v1",
+                "schema": "sglang-deepep-arrival-timeline-v2",
                 **context,
                 "input_tokens": input_tokens,
                 "profiler_overhead": {
@@ -660,14 +701,21 @@ class FusedMoE(torch.nn.Module):
                     "timed_cuda_event_count": 2,
                 },
                 "clock_alignment": {
-                    "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                    "method": (
+                        "bracketed private-stream CUDA anchor projected to host "
+                        "CLOCK_MONOTONIC"
+                    ),
                     "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
                     "anchor_bracket_start_ns": anchor_bracket_start_ns,
                     "anchor_bracket_end_ns": anchor_bracket_end_ns,
                     "uncertainty_ns": (
-                        anchor_bracket_end_ns - anchor_bracket_start_ns
+                        anchor_bracket_end_ns - anchor_bracket_start_ns + 1
                     )
-                    // 2,
+                    // 2
+                    + int(context["clock_contract"]["event_timing_guard_ns"]),
+                    "event_timing_guard_ns": int(
+                        context["clock_contract"]["event_timing_guard_ns"]
+                    ),
                 },
                 "arrival_timestamps": {
                     "moe_entry": aligned_timestamp(origin),
@@ -787,8 +835,14 @@ class FusedMoE(torch.nn.Module):
                 rank_local_ms = origin.elapsed_time(event)
                 return {
                     "rank_local_ms": rank_local_ms,
-                    "host_monotonic_ns_estimate": round(
-                        anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
+                    **cuda_event_host_interval(
+                        event,
+                        clock_anchor,
+                        anchor_bracket_start_ns=anchor_bracket_start_ns,
+                        anchor_bracket_end_ns=anchor_bracket_end_ns,
+                        event_timing_guard_ns=int(
+                            context["clock_contract"]["event_timing_guard_ns"]
+                        ),
                     ),
                 }
 
@@ -907,12 +961,21 @@ class FusedMoE(torch.nn.Module):
                     "timed_cuda_event_count": len(recorded) + 1,
                 },
                 "clock_alignment": {
-                    "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                    "method": (
+                        "bracketed private-stream CUDA anchor projected to host "
+                        "CLOCK_MONOTONIC"
+                    ),
                     "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
                     "anchor_bracket_start_ns": anchor_bracket_start_ns,
                     "anchor_bracket_end_ns": anchor_bracket_end_ns,
-                    "uncertainty_ns": (anchor_bracket_end_ns - anchor_bracket_start_ns)
-                    // 2,
+                    "uncertainty_ns": (
+                        anchor_bracket_end_ns - anchor_bracket_start_ns + 1
+                    )
+                    // 2
+                    + int(context["clock_contract"]["event_timing_guard_ns"]),
+                    "event_timing_guard_ns": int(
+                        context["clock_contract"]["event_timing_guard_ns"]
+                    ),
                 },
                 "arrival_timestamps": arrival_timestamps,
                 "dispatch": {

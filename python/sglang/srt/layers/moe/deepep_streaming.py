@@ -18,7 +18,10 @@ from typing import Any, Callable, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.profiling import submit_moe_timeline_collection
+from sglang.srt.layers.moe.profiling import (
+    cuda_event_host_interval,
+    submit_moe_timeline_collection,
+)
 
 _DEEPEP_STREAMING_REQUIRED_ENV = {
     "EP_EXPERIMENTAL_STREAMING_LANES": "1",
@@ -301,8 +304,14 @@ def _emit_streaming_timeline(
             rank_local_ms = origin.elapsed_time(event)
             return {
                 "rank_local_ms": rank_local_ms,
-                "host_monotonic_ns_estimate": round(
-                    anchor_midpoint_ns - event.elapsed_time(clock_anchor) * 1e6
+                **cuda_event_host_interval(
+                    event,
+                    clock_anchor,
+                    anchor_bracket_start_ns=anchor_bracket_start_ns,
+                    anchor_bracket_end_ns=anchor_bracket_end_ns,
+                    event_timing_guard_ns=int(
+                        context["clock_contract"]["event_timing_guard_ns"]
+                    ),
                 ),
             }
 
@@ -378,12 +387,21 @@ def _emit_streaming_timeline(
                 "timed_cuda_event_count": 4 * len(lane_events) + 3,
             },
             "clock_alignment": {
-                "method": "deferred private-stream CUDA event projected to host CLOCK_MONOTONIC",
+                "method": (
+                    "bracketed private-stream CUDA anchor projected to host "
+                    "CLOCK_MONOTONIC"
+                ),
                 "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
                 "anchor_bracket_start_ns": anchor_bracket_start_ns,
                 "anchor_bracket_end_ns": anchor_bracket_end_ns,
-                "uncertainty_ns": (anchor_bracket_end_ns - anchor_bracket_start_ns)
-                // 2,
+                "uncertainty_ns": (
+                    anchor_bracket_end_ns - anchor_bracket_start_ns + 1
+                )
+                // 2
+                + int(context["clock_contract"]["event_timing_guard_ns"]),
+                "event_timing_guard_ns": int(
+                    context["clock_contract"]["event_timing_guard_ns"]
+                ),
             },
             "arrival_timestamps": {
                 "moe_entry": aligned_timestamp(origin),
