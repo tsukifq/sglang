@@ -42,6 +42,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.profiling import (
+    calibrated_event_timing_guard_ns,
     cuda_event_host_interval,
     ensure_moe_timeline_collector,
     host_clock_domain_id,
@@ -393,7 +394,7 @@ class FusedMoE(torch.nn.Module):
         self._deepep_timeline_detail = "full"
         self._deepep_timeline_enable_file = ""
         self._deepep_timeline_run_id = ""
-        self._deepep_timeline_event_guard_ns = 1000
+        self._deepep_timeline_event_guard_ns = 0
         self._deepep_timeline_clock_domain = ""
         self._deepep_timeline_layer_weight = 1
         self._deepep_timeline_selected_layer = False
@@ -446,18 +447,9 @@ class FusedMoE(torch.nn.Module):
             self._deepep_timeline_run_id = os.getenv(
                 "SGLANG_DEEPEP_TIMELINE_RUN_ID", ""
             ).strip()
-            try:
-                self._deepep_timeline_event_guard_ns = int(
-                    os.getenv("SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS", "1000")
-                )
-            except ValueError as error:
-                raise ValueError(
-                    "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS must be an integer"
-                ) from error
-            if self._deepep_timeline_event_guard_ns < 0:
-                raise ValueError(
-                    "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS must be nonnegative"
-                )
+            self._deepep_timeline_event_guard_ns = (
+                calibrated_event_timing_guard_ns()
+            )
             if (
                 self._deepep_timeline_detail == "arrival"
                 and not self._deepep_timeline_run_id

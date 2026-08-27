@@ -22,6 +22,7 @@ _ACTIVE_MOE_TIMELINE: ContextVar[Optional[dict[str, Any]]] = ContextVar(
 )
 _COLLECTOR_LOCK = threading.Lock()
 _COLLECTOR_QUEUE: Optional[queue.Queue[Callable[[], None]]] = None
+_EVENT_GUARD_ENV = "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS"
 
 
 def host_clock_domain_id() -> str:
@@ -33,6 +34,24 @@ def host_clock_domain_id() -> str:
     except OSError:
         boot_id = "unknown-boot"
     return f"{socket.gethostname()}:{boot_id}"
+
+
+def calibrated_event_timing_guard_ns() -> int:
+    """Read the explicitly calibrated CUDA-event projection guard."""
+
+    raw_value = os.getenv(_EVENT_GUARD_ENV, "").strip()
+    if not raw_value:
+        raise ValueError(
+            f"{_EVENT_GUARD_ENV} must be explicitly set from a matched-host "
+            "readiness calibration"
+        )
+    try:
+        guard_ns = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{_EVENT_GUARD_ENV} must be an integer") from error
+    if guard_ns < 0:
+        raise ValueError(f"{_EVENT_GUARD_ENV} must be nonnegative")
+    return guard_ns
 
 
 def cuda_event_host_interval(
