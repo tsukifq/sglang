@@ -356,7 +356,7 @@ class DeepEPStreamingBuffer:
         buffers = get_resources().buffers
         state = buffers.get("deepep_streaming_ep_state")
         if state is None:
-            state = SimpleNamespace(buffer=None, signature=None)
+            state = SimpleNamespace(buffers=None, signature=None)
             buffers["deepep_streaming_ep_state"] = state
         return state
 
@@ -368,11 +368,20 @@ class DeepEPStreamingBuffer:
         router_topk: int,
         num_max_tokens_per_rank: int,
         use_fp8_dispatch: bool,
+        wavefront_slot: int = 0,
+        num_wavefront_slots: int = 1,
     ):
         if ElasticBuffer is None:
             raise RuntimeError(
                 "SGLANG_ENABLE_DEEPEP_STREAMING requires the Async MoE DeepEP "
                 "fork with ElasticBuffer streaming APIs"
+            )
+        if num_wavefront_slots <= 0:
+            raise ValueError("streaming wavefront slot count must be positive")
+        if not 0 <= wavefront_slot < num_wavefront_slots:
+            raise ValueError(
+                f"streaming wavefront slot {wavefront_slot} is outside "
+                f"[0, {num_wavefront_slots})"
             )
         signature = (
             group.size(),
@@ -380,28 +389,36 @@ class DeepEPStreamingBuffer:
             router_topk,
             num_max_tokens_per_rank,
             use_fp8_dispatch,
+            num_wavefront_slots,
         )
         state = cls._state()
-        if state.buffer is not None:
+        if state.buffers is not None:
             if state.signature != signature:
                 raise RuntimeError(
                     "all streaming MoE layers must share EP size, hidden size, "
-                    "top-k, token capacity, and dispatch dtype"
+                    "top-k, token capacity, dispatch dtype, and wavefront slots"
                 )
-            return state.buffer
+            return state.buffers[wavefront_slot]
 
-        state.signature = signature
-        state.buffer = ElasticBuffer(
-            group,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            hidden=hidden_size,
-            num_topk=router_topk,
-            use_fp8_dispatch=use_fp8_dispatch,
-            allow_hybrid_mode=False,
-            allow_multiple_reduction=False,
-            prefer_overlap_with_compute=True,
+        # Build the complete pool in deterministic slot order on every EP
+        # rank. Each slot owns an independent symmetric generation namespace,
+        # ingress/return storage, and per-source copy streams.
+        slot_buffers = tuple(
+            ElasticBuffer(
+                group,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                hidden=hidden_size,
+                num_topk=router_topk,
+                use_fp8_dispatch=use_fp8_dispatch,
+                allow_hybrid_mode=False,
+                allow_multiple_reduction=False,
+                prefer_overlap_with_compute=True,
+            )
+            for _ in range(num_wavefront_slots)
         )
-        return state.buffer
+        state.signature = signature
+        state.buffers = slot_buffers
+        return slot_buffers[wavefront_slot]
 
 
 class DeepEPConfig(BaseDispatcherConfig):
@@ -635,6 +652,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        *,
+        wavefront_slot: int = 0,
+        num_wavefront_slots: int = 1,
     ):
         """Submit ElasticBuffer dispatch and export its lane-local sidecar."""
 
@@ -674,6 +694,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
             self.use_fp8,
+            wavefront_slot=wavefront_slot,
+            num_wavefront_slots=num_wavefront_slots,
         )
         # Reject a source/native DeepEP mismatch before dispatch creates an
         # outstanding lane view that this process would be unable to release.
@@ -718,6 +740,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             source_topk_idx=topk_ids,
             transport_handle=transport_handle,
             transport_event=transport_event,
+            wavefront_slot=wavefront_slot,
             profile_events=profile_events,
         )
 
@@ -1063,6 +1086,7 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         self.streaming_enabled = is_deepep_streaming_enabled()
+        self.streaming_num_wavefront_slots = 1
         if self.streaming_enabled:
             configure_deepep_streaming_environment()
             if _is_npu or is_hip():
@@ -1076,8 +1100,7 @@ class DeepEPDispatcher(BaseDispatcher):
                     "streaming DeepEP requires --deepep-mode normal; auto resolves "
                     "decode to the incompatible low-latency transport"
                 )
-            if is_tbo_enabled():
-                raise ValueError("streaming DeepEP does not support two-batch overlap")
+            self.streaming_num_wavefront_slots = 2 if is_tbo_enabled() else 1
             if group.size() != 8:
                 raise ValueError("streaming DeepEP is currently restricted to EP8")
             if router_topk < group.size():
@@ -1110,6 +1133,8 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._streaming_dispatch_intermediate = {}
+        self._streaming_combine_intermediate = {}
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
         # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
@@ -1146,18 +1171,53 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        *,
+        wavefront_slot: Optional[int] = None,
     ):
         if not self.streaming_enabled:
             raise RuntimeError("streaming DeepEP is not enabled")
         if self._stage != _Stage.INITIAL:
             raise RuntimeError("streaming dispatch cannot overlap dispatcher stages")
-        return self._normal_dispatcher.dispatch_streaming(hidden_states, topk_output)
+        from sglang.srt.model_executor.forward_context import (
+            get_moe_wavefront_slot,
+            has_forward_context,
+        )
+
+        if wavefront_slot is None:
+            wavefront_slot = get_moe_wavefront_slot() if has_forward_context() else 0
+        if not 0 <= wavefront_slot < self.streaming_num_wavefront_slots:
+            raise RuntimeError(
+                f"MoE wavefront slot {wavefront_slot} is outside configured "
+                f"streaming slot range [0, {self.streaming_num_wavefront_slots})"
+            )
+        return self._normal_dispatcher.dispatch_streaming(
+            hidden_states,
+            topk_output,
+            wavefront_slot=wavefront_slot,
+            num_wavefront_slots=self.streaming_num_wavefront_slots,
+        )
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        tbo_subbatch_index: Optional[int] = None,
     ):
+        if self.streaming_enabled:
+            wavefront_slot = 0 if tbo_subbatch_index is None else tbo_subbatch_index
+            if wavefront_slot in self._streaming_dispatch_intermediate:
+                raise RuntimeError(
+                    f"streaming wavefront slot {wavefront_slot} already has "
+                    "an outstanding dispatch stage"
+                )
+            self._streaming_dispatch_intermediate[wavefront_slot] = (
+                self.dispatch_streaming(
+                    hidden_states,
+                    topk_output,
+                    wavefront_slot=wavefront_slot,
+                )
+            )
+            return
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
@@ -1165,7 +1225,15 @@ class DeepEPDispatcher(BaseDispatcher):
         )
         self._dispatch_intermediate_state = inner_state
 
-    def dispatch_b(self):
+    def dispatch_b(self, tbo_subbatch_index: Optional[int] = None):
+        if self.streaming_enabled:
+            wavefront_slot = 0 if tbo_subbatch_index is None else tbo_subbatch_index
+            if wavefront_slot not in self._streaming_dispatch_intermediate:
+                raise RuntimeError(
+                    f"streaming wavefront slot {wavefront_slot} has no "
+                    "dispatch_a result"
+                )
+            return self._streaming_dispatch_intermediate.pop(wavefront_slot)
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
@@ -1183,7 +1251,23 @@ class DeepEPDispatcher(BaseDispatcher):
     def combine_a(
         self,
         combine_input: CombineInput,
+        tbo_subbatch_index: Optional[int] = None,
     ):
+        if self.streaming_enabled:
+            wavefront_slot = 0 if tbo_subbatch_index is None else tbo_subbatch_index
+            result_slot = combine_input.dispatch.wavefront_slot
+            if result_slot != wavefront_slot:
+                raise RuntimeError(
+                    f"streaming result belongs to wavefront slot {result_slot}, "
+                    f"not {wavefront_slot}"
+                )
+            if wavefront_slot in self._streaming_combine_intermediate:
+                raise RuntimeError(
+                    f"streaming wavefront slot {wavefront_slot} already has "
+                    "an outstanding combine stage"
+                )
+            self._streaming_combine_intermediate[wavefront_slot] = combine_input
+            return
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
@@ -1193,7 +1277,15 @@ class DeepEPDispatcher(BaseDispatcher):
         )
         self._combine_intermediate_state = inner_state
 
-    def combine_b(self):
+    def combine_b(self, tbo_subbatch_index: Optional[int] = None):
+        if self.streaming_enabled:
+            wavefront_slot = 0 if tbo_subbatch_index is None else tbo_subbatch_index
+            if wavefront_slot not in self._streaming_combine_intermediate:
+                raise RuntimeError(
+                    f"streaming wavefront slot {wavefront_slot} has no "
+                    "combine_a result"
+                )
+            return self._streaming_combine_intermediate.pop(wavefront_slot).output
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state

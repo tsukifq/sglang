@@ -72,21 +72,25 @@ def execute_overlapped_operations(
 
 
 def _resolve_tbo_child_contexts():
-    """Return (child_ctx_a, child_ctx_b) derived from the active TboAttnBackend,
-    or (None, None) if the active backend is not a TBO dispatcher (e.g. a
-    backend that handles TBO splitting internally like DeepSeek MHA's
-    _resolve_attn_backend path)."""
+    """Return child contexts with distinct MoE wavefront slots.
+
+    If attention handles TBO internally, retain its active backend while
+    assigning the two slots.
+    """
     # Lazy import to avoid circular dependency at module load time.
     from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
     ctx = get_forward_context()
     backend = ctx.attn_backend
     if not isinstance(backend, TboAttnBackend):
-        return None, None
+        return (
+            replace(ctx, moe_wavefront_slot=0),
+            replace(ctx, moe_wavefront_slot=1),
+        )
     child_a, child_b = backend.children
     return (
-        replace(ctx, attn_backend=child_a),
-        replace(ctx, attn_backend=child_b),
+        replace(ctx, attn_backend=child_a, moe_wavefront_slot=0),
+        replace(ctx, attn_backend=child_b, moe_wavefront_slot=1),
     )
 
 

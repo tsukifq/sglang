@@ -81,6 +81,7 @@ class DeepEPStreamingDispatch:
     transport_handle: Any
     transport_event: Any
     profile_events: dict[str, torch.cuda.Event] | None = None
+    wavefront_slot: int = 0
 
     @classmethod
     def from_runtime(
@@ -92,6 +93,7 @@ class DeepEPStreamingDispatch:
         transport_handle: Any,
         transport_event: Any,
         profile_events: dict[str, torch.cuda.Event] | None = None,
+        wavefront_slot: int = 0,
     ) -> "DeepEPStreamingDispatch":
         if len(raw) != 7:
             raise ValueError(f"expected seven DeepEP lane-view fields, got {len(raw)}")
@@ -102,6 +104,7 @@ class DeepEPStreamingDispatch:
             transport_handle,
             transport_event,
             dict(profile_events or {}),
+            wavefront_slot,
         )
         view.validate()
         return view
@@ -109,6 +112,8 @@ class DeepEPStreamingDispatch:
     def validate(self) -> None:
         if self.generation <= 0:
             raise ValueError("DeepEP streaming generation must be positive")
+        if self.wavefront_slot < 0:
+            raise ValueError("DeepEP streaming wavefront slot must be non-negative")
         if self.x.ndim != 3:
             raise ValueError(
                 "lane activation must have shape [lanes, capacity, hidden]"

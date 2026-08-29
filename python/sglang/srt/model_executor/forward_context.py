@@ -38,6 +38,9 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    # TBO child index used by streaming MoE to select an independent request
+    # wavefront slot. Ordinary forwards stay on slot 0.
+    moe_wavefront_slot: int = 0
 
 
 _current: Optional[ForwardContext] = None
@@ -65,6 +68,13 @@ def get_forward_context() -> ForwardContext:
 
 def get_attn_backend() -> AttentionBackend:
     return get_forward_context().attn_backend
+
+
+def get_moe_wavefront_slot() -> int:
+    slot = get_forward_context().moe_wavefront_slot
+    if slot < 0:
+        raise RuntimeError(f"invalid MoE wavefront slot {slot}")
+    return slot
 
 
 def get_token_to_kv_pool() -> KVCache:

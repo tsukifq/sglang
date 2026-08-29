@@ -33,6 +33,8 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.deepep_streaming import (
+    DeepEPStreamingDispatch,
+    DeepEPStreamingLayerResult,
     is_deepep_streaming_enabled,
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
@@ -384,9 +386,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
-        self._deepep_streaming_streams = None
-        self._deepep_streaming_drain_stream = None
-        self._deepep_streaming_inflight = None
+        self._deepep_streaming_streams = {}
+        self._deepep_streaming_drain_streams = {}
+        self._deepep_streaming_inflight = {}
         self._deepep_streaming_fp8 = False
         self._deepep_timeline_calls = 0
         self._deepep_timeline_target_call = 0
@@ -1196,12 +1198,6 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("streaming DeepEP requires standard top-k output")
         if torch.is_grad_enabled():
             raise RuntimeError("streaming DeepEP is inference-only")
-        if self._deepep_streaming_streams is None:
-            self._deepep_streaming_streams = tuple(
-                torch.cuda.Stream(priority=0) for _ in range(self.moe_ep_size)
-            )
-            self._deepep_streaming_drain_stream = torch.cuda.Stream(priority=0)
-
         timeline_origin = None
         dispatch_timeline = None
         if timeline_context is not None:
@@ -1220,6 +1216,31 @@ class FusedMoE(torch.nn.Module):
                 hidden_states=hidden_states,
                 topk_output=topk_output,
             )
+        return self._run_deepep_streaming_dispatch(
+            dispatch,
+            timeline_context=timeline_context,
+            timeline_origin=timeline_origin,
+        ).output
+
+    def _run_deepep_streaming_dispatch(
+        self,
+        dispatch: DeepEPStreamingDispatch,
+        *,
+        timeline_context: Optional[dict] = None,
+        timeline_origin: Optional[torch.cuda.Event] = None,
+    ) -> DeepEPStreamingLayerResult:
+        """Consume one request slot without joining another slot's resources."""
+
+        wavefront_slot = dispatch.wavefront_slot
+        if wavefront_slot not in self._deepep_streaming_streams:
+            self._deepep_streaming_streams[wavefront_slot] = tuple(
+                torch.cuda.Stream(priority=0) for _ in range(self.moe_ep_size)
+            )
+            self._deepep_streaming_drain_streams[wavefront_slot] = (
+                torch.cuda.Stream(priority=0)
+            )
+        lane_streams = self._deepep_streaming_streams[wavefront_slot]
+        drain_stream = self._deepep_streaming_drain_streams[wavefront_slot]
         if self._deepep_streaming_fp8:
             result = launch_fp8_streaming_moe(
                 dispatch,
@@ -1228,8 +1249,8 @@ class FusedMoE(torch.nn.Module):
                 self.w13_weight_scale_inv,
                 self.w2_weight_scale_inv,
                 self.quant_method.weight_block_size,
-                streams=self._deepep_streaming_streams,
-                drain_stream=self._deepep_streaming_drain_stream,
+                streams=lane_streams,
+                drain_stream=drain_stream,
                 timeline_context=timeline_context,
                 timeline_origin=timeline_origin,
             )
@@ -1238,16 +1259,16 @@ class FusedMoE(torch.nn.Module):
                 dispatch,
                 self.w13_weight,
                 self.w2_weight,
-                streams=self._deepep_streaming_streams,
-                drain_stream=self._deepep_streaming_drain_stream,
+                streams=lane_streams,
+                drain_stream=drain_stream,
                 timeline_context=timeline_context,
                 timeline_origin=timeline_origin,
             )
         # Retain events, transport handle, and sidecar tensors until this layer's
         # next invocation. DeepEP gates remote ingress reuse with per-lane ACKs;
         # the drain event here protects only local tensor/event lifetime.
-        self._deepep_streaming_inflight = result
-        return result.output
+        self._deepep_streaming_inflight[wavefront_slot] = result
+        return result
 
     def _load_per_tensor_weight_scale(
         self,
@@ -2246,8 +2267,12 @@ class FusedMoE(torch.nn.Module):
 
         return self.dispatcher.combine(combine_input=combine_input)
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(
+        self, dispatch_output: DispatchOutput | DeepEPStreamingDispatch
+    ) -> CombineInput | DeepEPStreamingLayerResult:
         # TODO: consider using symmetric memory
+        if isinstance(dispatch_output, DeepEPStreamingDispatch):
+            return self._run_deepep_streaming_dispatch(dispatch_output)
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,

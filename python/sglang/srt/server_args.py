@@ -5856,9 +5856,10 @@ class ServerArgs:
                 "--enable-deepep-streaming requires "
                 "--moe-runner-backend deep_gemm"
             )
-        if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+        if self.enable_single_batch_overlap:
             raise ValueError(
-                "--enable-deepep-streaming does not yet support TBO or SBO"
+                "--enable-deepep-streaming does not yet support SBO; "
+                "use --enable-two-batch-overlap for the two-slot request wavefront"
             )
         if self.enable_waterfill or self.enforce_shared_experts_fusion:
             raise ValueError(

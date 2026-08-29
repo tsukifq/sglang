@@ -1184,6 +1184,21 @@ class TestDeepEPStreamingArgs(CustomTestCase):
                 server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
             )
 
+    def test_streaming_accepts_two_batch_request_wavefront(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(enable_two_batch_overlap=True)
+            server_args._handle_a2a_moe()
+            server_args._check_two_batch_overlap()
+
+            self.assertTrue(server_args.enable_deepep_streaming)
+            self.assertTrue(server_args.enable_two_batch_overlap)
+
+    def test_streaming_still_rejects_single_batch_overlap(self):
+        with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(False):
+            server_args = self._args(enable_single_batch_overlap=True)
+            with self.assertRaisesRegex(ValueError, "does not yet support SBO"):
+                server_args._handle_a2a_moe()
+
     def test_legacy_environment_gate_uses_same_validation(self):
         with envs.SGLANG_ENABLE_DEEPEP_STREAMING.override(True):
             server_args = self._args(enable_deepep_streaming=False)

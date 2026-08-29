@@ -1,8 +1,10 @@
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.batch_overlap.operations import _resolve_tbo_child_contexts
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
     _lane_layout_from_psum,
@@ -12,7 +14,17 @@ from sglang.srt.layers.moe.deepep_streaming import (
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
 )
-from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplNormal
+from sglang.srt.layers.moe.token_dispatcher import deepep as deepep_dispatcher_module
+from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPDispatcher,
+    DeepEPStreamingBuffer,
+    _DeepEPDispatcherImplNormal,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_moe_wavefront_slot,
+)
 
 
 @pytest.mark.parametrize(
@@ -52,6 +64,15 @@ def test_streaming_environment_rejects_disabled_nccl_cumem(monkeypatch):
     monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
     with pytest.raises(RuntimeError, match="NCCL_CUMEM_ENABLE=1"):
         configure_deepep_streaming_environment()
+
+
+def test_tbo_children_receive_distinct_moe_wavefront_slots():
+    with forward_context(ForwardContext(attn_backend=object())):
+        child_a, child_b = _resolve_tbo_child_contexts()
+    assert child_a.moe_wavefront_slot == 0
+    assert child_b.moe_wavefront_slot == 1
+    with forward_context(child_b):
+        assert get_moe_wavefront_slot() == 1
 
 
 def test_streaming_dispatch_rejects_incomplete_runtime_view():
@@ -174,6 +195,95 @@ def test_streaming_dispatch_preflights_release_api_before_transport():
     transport = source.index("buffer.dispatch(", preflight)
 
     assert preflight < transport
+
+
+def test_streaming_buffer_pool_builds_independent_wavefront_slots(monkeypatch):
+    state = SimpleNamespace(buffers=None, signature=None)
+    created = []
+
+    class FakeElasticBuffer:
+        def __init__(self, group, **kwargs):
+            self.group = group
+            self.kwargs = kwargs
+            created.append(self)
+
+    class FakeGroup:
+        def size(self):
+            return 8
+
+    monkeypatch.setattr(
+        DeepEPStreamingBuffer,
+        "_state",
+        classmethod(lambda cls: state),
+    )
+    monkeypatch.setattr(
+        deepep_dispatcher_module, "ElasticBuffer", FakeElasticBuffer
+    )
+
+    slot0 = DeepEPStreamingBuffer.get_buffer(
+        FakeGroup(), 4096, 8, 256, False, wavefront_slot=0, num_wavefront_slots=2
+    )
+    slot1 = DeepEPStreamingBuffer.get_buffer(
+        FakeGroup(), 4096, 8, 256, False, wavefront_slot=1, num_wavefront_slots=2
+    )
+
+    assert len(created) == 2
+    assert slot0 is created[0]
+    assert slot1 is created[1]
+    assert slot0 is not slot1
+    assert state.buffers == (slot0, slot1)
+
+
+def test_streaming_buffer_pool_rejects_slot_signature_drift(monkeypatch):
+    state = SimpleNamespace(
+        buffers=(object(), object()),
+        signature=(8, 4096, 8, 256, False, 2),
+    )
+
+    class FakeGroup:
+        def size(self):
+            return 8
+
+    monkeypatch.setattr(
+        DeepEPStreamingBuffer,
+        "_state",
+        classmethod(lambda cls: state),
+    )
+    monkeypatch.setattr(deepep_dispatcher_module, "ElasticBuffer", object)
+    with pytest.raises(RuntimeError, match="wavefront slots"):
+        DeepEPStreamingBuffer.get_buffer(
+            FakeGroup(),
+            4096,
+            8,
+            256,
+            False,
+            wavefront_slot=0,
+            num_wavefront_slots=1,
+        )
+
+
+def test_streaming_staged_dispatch_keeps_two_wavefront_slots_independent():
+    dispatcher = object.__new__(DeepEPDispatcher)
+    dispatcher.streaming_enabled = True
+    dispatcher._streaming_dispatch_intermediate = {}
+    dispatcher._streaming_combine_intermediate = {}
+    dispatcher.dispatch_streaming = lambda hidden, topk, *, wavefront_slot: (
+        SimpleNamespace(wavefront_slot=wavefront_slot, hidden=hidden)
+    )
+
+    dispatcher.dispatch_a("request-a", "topk-a", tbo_subbatch_index=0)
+    dispatcher.dispatch_a("request-b", "topk-b", tbo_subbatch_index=1)
+    request_b = dispatcher.dispatch_b(tbo_subbatch_index=1)
+    request_a = dispatcher.dispatch_b(tbo_subbatch_index=0)
+
+    assert request_a.hidden == "request-a"
+    assert request_b.hidden == "request-b"
+    result_a = SimpleNamespace(dispatch=request_a, output="output-a")
+    result_b = SimpleNamespace(dispatch=request_b, output="output-b")
+    dispatcher.combine_a(result_a, tbo_subbatch_index=0)
+    dispatcher.combine_a(result_b, tbo_subbatch_index=1)
+    assert dispatcher.combine_b(tbo_subbatch_index=1) == "output-b"
+    assert dispatcher.combine_b(tbo_subbatch_index=0) == "output-a"
 
 
 def test_timeline_decodes_aligned_lane_psum_without_counting_holes():
