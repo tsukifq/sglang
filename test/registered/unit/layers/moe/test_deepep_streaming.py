@@ -7,10 +7,12 @@ from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
+    _require_per_lane_release,
     configure_deepep_streaming_environment,
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplNormal
 
 
 @pytest.mark.parametrize(
@@ -68,8 +70,97 @@ def test_streaming_layer_keeps_dependencies_on_device():
     assert "cuStreamWaitValue64" in source
     assert "streaming_combine_return" in source
     assert "streaming_combine_reduce" in source
+    assert "release_streaming_lane(lane, dispatch.generation)" in source
     assert ".synchronize(" not in source
     assert ".barrier(" not in source
+
+
+def test_streaming_lane_ack_is_ordered_after_lane_return():
+    source = inspect.getsource(_launch_streaming_moe_lanes)
+
+    combine_return = source.index("dispatch.buffer.streaming_combine_return(")
+    release_lane = source.index(
+        "release_streaming_lane(lane, dispatch.generation)", combine_return
+    )
+    lane_finalized = source.index("lane_finalized.record(stream)", release_lane)
+
+    assert combine_return < release_lane < lane_finalized
+
+
+def test_streaming_timeline_snapshots_workspace_psum_before_lane_release():
+    source = inspect.getsource(_launch_streaming_moe_lanes)
+
+    snapshot = source.index(
+        "expert_psum_snapshot[lane].copy_(dispatch.expert_psum[lane])"
+    )
+    release_lane = source.index(
+        "release_streaming_lane(lane, dispatch.generation)", snapshot
+    )
+
+    assert snapshot < release_lane
+
+
+def test_streaming_view_finalize_is_after_reduce_and_lane_drain_waits():
+    source = inspect.getsource(_launch_streaming_moe_lanes)
+
+    reduce = source.index("dispatch.buffer.streaming_combine_reduce(")
+    drain_join = source.index("with torch.cuda.stream(drain_stream):", reduce)
+    lane_wait = source.index("drain_stream.wait_event(done)", drain_join)
+    finalize = source.index("dispatch.buffer.release_streaming_lane_view()", lane_wait)
+    epoch_drained = source.index("epoch_drained.record(drain_stream)", finalize)
+
+    assert reduce < drain_join < lane_wait < finalize < epoch_drained
+
+
+def test_streaming_lane_release_api_is_fail_closed():
+    class LegacyBuffer:
+        def release_streaming_lane_view(self):
+            raise AssertionError("unsafe legacy fallback must not be called")
+
+    with pytest.raises(RuntimeError, match="generation-aware.*release_streaming_lane"):
+        _require_per_lane_release(LegacyBuffer())
+
+
+def test_streaming_lane_release_api_returns_exact_callable():
+    calls = []
+
+    class Buffer:
+        def release_streaming_lane(self, source_rank, generation):
+            calls.append((source_rank, generation))
+
+        def release_streaming_lane_view(self):
+            pass
+
+    release_lane = _require_per_lane_release(Buffer())
+    release_lane(3, 11)
+
+    assert calls == [(3, 11)]
+
+
+def test_streaming_lane_release_rejects_stale_native_runtime():
+    class StaleRuntime:
+        pass
+
+    class SourceWrapper:
+        runtime = StaleRuntime()
+
+        def release_streaming_lane(self, source_rank, generation):
+            raise AssertionError("stale native runtime must be rejected first")
+
+        def release_streaming_lane_view(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="generation-aware.*release_streaming_lane"):
+        _require_per_lane_release(SourceWrapper())
+
+
+def test_streaming_dispatch_preflights_release_api_before_transport():
+    source = inspect.getsource(_DeepEPDispatcherImplNormal.dispatch_streaming)
+
+    preflight = source.index("_require_per_lane_release(buffer)")
+    transport = source.index("buffer.dispatch(", preflight)
+
+    assert preflight < transport
 
 
 def test_timeline_decodes_aligned_lane_psum_without_counting_holes():

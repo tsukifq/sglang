@@ -178,6 +178,38 @@ class DeepEPStreamingLayerResult:
         return self.output
 
 
+def _require_per_lane_release(buffer: Any) -> Callable[[int, int], None]:
+    """Return the generation-aware lane releaser or fail before submission.
+
+    The destination-wide ``release_streaming_lane_view`` API couples every
+    source lane to the slowest local lane.  It is not a safe compatibility
+    fallback here: mixing it with per-lane reuse would either restore that
+    coupling or acknowledge lanes whose combine-return kernel still reads the
+    shared lane control block.
+    """
+
+    release_lane = getattr(buffer, "release_streaming_lane", None)
+    finalize_view = getattr(buffer, "release_streaming_lane_view", None)
+    runtime = getattr(buffer, "runtime", None)
+    runtime_release_lane = (
+        getattr(runtime, "release_streaming_lane", None)
+        if runtime is not None
+        else release_lane
+    )
+    if (
+        not callable(release_lane)
+        or not callable(finalize_view)
+        or not callable(runtime_release_lane)
+    ):
+        raise RuntimeError(
+            "streaming DeepEP requires the generation-aware "
+            "buffer.release_streaming_lane(source_rank, generation) API; "
+            "refusing the destination-wide release_streaming_lane_view "
+            "fallback because it is not per-lane safe"
+        )
+    return release_lane
+
+
 def _check_cuda_driver(result: tuple[Any, ...], operation: str, cuda: Any) -> None:
     if result != (cuda.CUresult.CUDA_SUCCESS,):
         raise RuntimeError(f"{operation} failed: {result}")
@@ -242,6 +274,7 @@ def _logical_outbound_dispatch_from_host(
 
 def _emit_streaming_timeline(
     dispatch: DeepEPStreamingDispatch,
+    expert_psum_snapshot: torch.Tensor,
     context: dict[str, Any],
     origin: torch.cuda.Event,
     dispatch_done: torch.cuda.Event,
@@ -254,7 +287,10 @@ def _emit_streaming_timeline(
     defer_started_ns = time.monotonic_ns()
     device = dispatch.x.device
     lane_events = tuple(dict(events) for events in lane_events)
-    expert_psum = dispatch.expert_psum.detach()
+    # The workspace-backed live psum may already be reused lane-by-lane by a
+    # later generation while this off-thread collector is waiting.  Consume
+    # the generation-owned snapshot captured before each lane ACK instead.
+    expert_psum = expert_psum_snapshot.detach()
     source_topk_idx = dispatch.source_topk_idx.detach()
     generation = dispatch.generation
     input_tokens = source_topk_idx.size(0)
@@ -589,6 +625,9 @@ def _launch_streaming_moe_lanes(
         raise ValueError(f"expected {lanes} lane streams, got {len(streams)}")
     if drain_stream is None:
         drain_stream = torch.cuda.Stream(priority=0)
+    # Resolve the protocol before queuing any device work.  A partially
+    # submitted generation cannot safely fall back to the old all-lane ACK.
+    release_streaming_lane = _require_per_lane_release(dispatch.buffer)
 
     lane_output = torch.empty(
         dispatch.x.shape, dtype=torch.bfloat16, device=dispatch.x.device
@@ -610,6 +649,9 @@ def _launch_streaming_moe_lanes(
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
     lane_timeline: list[dict[str, torch.cuda.Event]] = []
+    expert_psum_snapshot = (
+        torch.empty_like(dispatch.expert_psum) if timeline_enabled else None
+    )
     dispatch_done = None
     if timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
@@ -635,6 +677,11 @@ def _launch_streaming_moe_lanes(
             0, lane * metadata_capacity, metadata_capacity
         )
         with torch.cuda.stream(stream):
+            if expert_psum_snapshot is not None:
+                # Snapshot shared lane control before this lane's release lets
+                # generation g+1 reuse the workspace without corrupting the
+                # deferred diagnostic collector.  Keep it outside GEMM timing.
+                expert_psum_snapshot[lane].copy_(dispatch.expert_psum[lane])
             gemm_start = (
                 torch.cuda.Event(enable_timing=True) if timeline_enabled else None
             )
@@ -658,9 +705,17 @@ def _launch_streaming_moe_lanes(
             dispatch.buffer.streaming_combine_return(
                 lane_output[lane], metadata, lane, dispatch.generation
             )
-            done = return_done or torch.cuda.Event()
-            done.record(stream)
-            returned.append(done)
+            if return_done is not None:
+                return_done.record(stream)
+
+            # combine-return still reads this lane's shared dispatch control
+            # fields.  Queue the ACK after it on the same stream so a fast
+            # lane can release its source ingress independently, without
+            # allowing generation g+1 to overwrite those fields too early.
+            release_streaming_lane(lane, dispatch.generation)
+            lane_finalized = torch.cuda.Event()
+            lane_finalized.record(stream)
+            returned.append(lane_finalized)
             if timeline_enabled:
                 lane_timeline.append(
                     {
@@ -693,6 +748,10 @@ def _launch_streaming_moe_lanes(
     )
     if reduce_done is not None:
         reduce_done.record(source_stream)
+    # Per-lane release calls publish the remote ACKs.  This drain protects only
+    # local view/tensor lifetime: strict per-lane DeepEP records its event for
+    # destroy, but deliberately does not make the next dispatch wait on it.
+    # Reduce must be host-submitted before finalizing the outstanding view.
     with torch.cuda.stream(drain_stream):
         for done in returned:
             drain_stream.wait_event(done)
@@ -701,8 +760,10 @@ def _launch_streaming_moe_lanes(
         epoch_drained.record(drain_stream)
 
     if timeline_enabled:
+        assert expert_psum_snapshot is not None
         _emit_streaming_timeline(
             dispatch,
+            expert_psum_snapshot,
             timeline_context,
             timeline_origin,
             dispatch_done,

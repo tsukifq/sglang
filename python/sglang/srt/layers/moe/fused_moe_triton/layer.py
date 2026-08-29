@@ -1244,7 +1244,8 @@ class FusedMoE(torch.nn.Module):
                 timeline_origin=timeline_origin,
             )
         # Retain events, transport handle, and sidecar tensors until this layer's
-        # next invocation. DeepEP separately gates epoch reuse on the drain event.
+        # next invocation. DeepEP gates remote ingress reuse with per-lane ACKs;
+        # the drain event here protects only local tensor/event lifetime.
         self._deepep_streaming_inflight = result
         return result.output
 

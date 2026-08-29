@@ -638,7 +638,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         """Submit ElasticBuffer dispatch and export its lane-local sidecar."""
 
-        from sglang.srt.layers.moe.deepep_streaming import DeepEPStreamingDispatch
+        from sglang.srt.layers.moe.deepep_streaming import (
+            DeepEPStreamingDispatch,
+            _require_per_lane_release,
+        )
 
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError("streaming DeepEP dispatch requires BF16 hidden states")
@@ -672,6 +675,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.use_fp8,
         )
+        # Reject a source/native DeepEP mismatch before dispatch creates an
+        # outstanding lane view that this process would be unable to release.
+        _require_per_lane_release(buffer)
         previous_event = ElasticBuffer.capture()
         _record_dispatch_input_ready(buffer, previous_event)
         (
