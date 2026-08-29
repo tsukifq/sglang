@@ -39,6 +39,7 @@ _DEEPEP_STREAMING_REQUIRED_ENV = {
 _DEEPEP_STREAMING_INCOMPATIBLE_ENV = (
     "EP_EXPERIMENTAL_STREAMING_COPY_SHADOW",
     "EP_EXPERIMENTAL_RANK_READY",
+    "EP_EXPERIMENTAL_STREAMING_INSTRUMENTED_BULK",
 )
 
 
@@ -727,6 +728,7 @@ def launch_bf16_streaming_moe(
     *,
     streams: Sequence[torch.cuda.Stream] | None = None,
     drain_stream: torch.cuda.Stream | None = None,
+    expected_m_per_expert: int | None = None,
     timeline_context: dict[str, Any] | None = None,
     timeline_origin: torch.cuda.Event | None = None,
 ) -> DeepEPStreamingLayerResult:
@@ -748,6 +750,12 @@ def launch_bf16_streaming_moe(
         )
     if w13_weight.dtype != torch.bfloat16 or w2_weight.dtype != torch.bfloat16:
         raise ValueError("streaming MoE currently supports BF16 expert weights only")
+    if expected_m_per_expert is not None and (
+        isinstance(expected_m_per_expert, bool)
+        or not isinstance(expected_m_per_expert, int)
+        or expected_m_per_expert <= 0
+    ):
+        raise ValueError("expected_m_per_expert must be a positive integer")
     if w13_weight.ndim != 3 or w2_weight.ndim != 3:
         raise ValueError("expert weights must have shape [experts, N, K]")
 
@@ -783,6 +791,7 @@ def launch_bf16_streaming_moe(
             gate_up[lane],
             dispatch.expert_psum[lane],
             use_psum_layout=True,
+            expected_m_for_psum_layout=expected_m_per_expert,
         )
         silu_and_mul(gate_up[lane], down_input[lane])
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
@@ -791,6 +800,7 @@ def launch_bf16_streaming_moe(
             lane_output,
             dispatch.expert_psum[lane],
             use_psum_layout=True,
+            expected_m_for_psum_layout=expected_m_per_expert,
         )
         return ()
 

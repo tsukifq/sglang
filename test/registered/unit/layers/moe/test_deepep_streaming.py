@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.deepep_streaming import (
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
     configure_deepep_streaming_environment,
+    launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
 )
 
@@ -17,6 +18,7 @@ from sglang.srt.layers.moe.deepep_streaming import (
     [
         "EP_EXPERIMENTAL_STREAMING_COPY_SHADOW",
         "EP_EXPERIMENTAL_RANK_READY",
+        "EP_EXPERIMENTAL_STREAMING_INSTRUMENTED_BULK",
     ],
 )
 def test_streaming_environment_rejects_mixed_protocols(monkeypatch, name):
@@ -88,3 +90,14 @@ def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
     assert "fuse_silu_and_mul=True" in source
     assert "m_indices" not in source
     assert "shadow" in source
+
+
+def test_bf16_streaming_forwards_per_expert_shape_hint_to_both_gemms():
+    signature = inspect.signature(launch_bf16_streaming_moe)
+    assert signature.parameters["expected_m_per_expert"].default is None
+
+    source = inspect.getsource(launch_bf16_streaming_moe)
+    assert source.count(
+        "expected_m_for_psum_layout=expected_m_per_expert"
+    ) == 2
+    assert "expected_m_per_expert must be a positive integer" in source
