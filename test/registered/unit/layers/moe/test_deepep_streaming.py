@@ -75,29 +75,21 @@ def test_streaming_layer_keeps_dependencies_on_device():
     assert ".barrier(" not in source
 
 
-def test_streaming_lane_ack_is_ordered_after_lane_return():
+def test_streaming_lane_ack_is_ordered_after_pack_wait_and_before_gemm():
     source = inspect.getsource(_launch_streaming_moe_lanes)
 
+    pack_wait = source.index("cuStreamWaitValue64")
+    release_lane = source.index("release_streaming_lane(lane, dispatch.generation)")
+    lane_compute = source.index("lane_compute(lane, lane_output[lane])")
     combine_return = source.index("dispatch.buffer.streaming_combine_return(")
-    release_lane = source.index(
-        "release_streaming_lane(lane, dispatch.generation)", combine_return
-    )
-    lane_finalized = source.index("lane_finalized.record(stream)", release_lane)
 
-    assert combine_return < release_lane < lane_finalized
+    assert pack_wait < release_lane < lane_compute < combine_return
 
 
-def test_streaming_timeline_snapshots_workspace_psum_before_lane_release():
+def test_streaming_generation_owned_control_removes_deferred_psum_copy():
     source = inspect.getsource(_launch_streaming_moe_lanes)
 
-    snapshot = source.index(
-        "expert_psum_snapshot[lane].copy_(dispatch.expert_psum[lane])"
-    )
-    release_lane = source.index(
-        "release_streaming_lane(lane, dispatch.generation)", snapshot
-    )
-
-    assert snapshot < release_lane
+    assert "expert_psum_snapshot" not in source
 
 
 def test_streaming_view_finalize_is_after_reduce_and_lane_drain_waits():
@@ -125,6 +117,9 @@ def test_streaming_lane_release_api_returns_exact_callable():
     calls = []
 
     class Buffer:
+        def get_streaming_lane_protocol_version(self):
+            return 2
+
         def release_streaming_lane(self, source_rank, generation):
             calls.append((source_rank, generation))
 
@@ -144,6 +139,9 @@ def test_streaming_lane_release_rejects_stale_native_runtime():
     class SourceWrapper:
         runtime = StaleRuntime()
 
+        def get_streaming_lane_protocol_version(self):
+            return 2
+
         def release_streaming_lane(self, source_rank, generation):
             raise AssertionError("stale native runtime must be rejected first")
 
@@ -152,6 +150,21 @@ def test_streaming_lane_release_rejects_stale_native_runtime():
 
     with pytest.raises(RuntimeError, match="generation-aware.*release_streaming_lane"):
         _require_per_lane_release(SourceWrapper())
+
+
+def test_streaming_lane_release_rejects_v1_before_transport():
+    class V1Buffer:
+        def get_streaming_lane_protocol_version(self):
+            return 1
+
+        def release_streaming_lane(self, source_rank, generation):
+            raise AssertionError("v1 release must not be returned")
+
+        def release_streaming_lane_view(self):
+            pass
+
+    with pytest.raises(RuntimeError, match="protocol v2 before transport"):
+        _require_per_lane_release(V1Buffer())
 
 
 def test_streaming_dispatch_preflights_release_api_before_transport():

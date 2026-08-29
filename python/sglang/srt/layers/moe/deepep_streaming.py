@@ -179,33 +179,48 @@ class DeepEPStreamingLayerResult:
 
 
 def _require_per_lane_release(buffer: Any) -> Callable[[int, int], None]:
-    """Return the generation-aware lane releaser or fail before submission.
+    """Return the v2 generation-aware lane releaser or fail before submission.
 
-    The destination-wide ``release_streaming_lane_view`` API couples every
-    source lane to the slowest local lane.  It is not a safe compatibility
-    fallback here: mixing it with per-lane reuse would either restore that
-    coupling or acknowledge lanes whose combine-return kernel still reads the
-    shared lane control block.
+    Protocol v1 publishes its safe-release marker in combine-return, so
+    queuing that ACK before GEMM would deadlock the lane stream. Falling back
+    to destination-wide ``release_streaming_lane_view`` after all returns
+    would restore the slowest-lane coupling. Protocol v2 snapshots every
+    downstream input during pack and can acknowledge ingress before GEMM.
     """
 
     release_lane = getattr(buffer, "release_streaming_lane", None)
     finalize_view = getattr(buffer, "release_streaming_lane_view", None)
+    protocol_version = getattr(buffer, "get_streaming_lane_protocol_version", None)
     runtime = getattr(buffer, "runtime", None)
     runtime_release_lane = (
         getattr(runtime, "release_streaming_lane", None)
         if runtime is not None
         else release_lane
     )
+    runtime_protocol_version = (
+        getattr(runtime, "get_streaming_lane_protocol_version", None)
+        if runtime is not None
+        else protocol_version
+    )
     if (
         not callable(release_lane)
         or not callable(finalize_view)
         or not callable(runtime_release_lane)
+        or not callable(protocol_version)
+        or not callable(runtime_protocol_version)
     ):
         raise RuntimeError(
-            "streaming DeepEP requires the generation-aware "
+            "streaming DeepEP requires protocol v2 and the generation-aware "
             "buffer.release_streaming_lane(source_rank, generation) API; "
             "refusing the destination-wide release_streaming_lane_view "
             "fallback because it is not per-lane safe"
+        )
+    wrapper_version = protocol_version()
+    native_version = runtime_protocol_version()
+    if wrapper_version != 2 or native_version != 2:
+        raise RuntimeError(
+            "streaming DeepEP requires lane protocol v2 before transport; "
+            f"wrapper={wrapper_version!r}, native={native_version!r}"
         )
     return release_lane
 
@@ -274,7 +289,6 @@ def _logical_outbound_dispatch_from_host(
 
 def _emit_streaming_timeline(
     dispatch: DeepEPStreamingDispatch,
-    expert_psum_snapshot: torch.Tensor,
     context: dict[str, Any],
     origin: torch.cuda.Event,
     dispatch_done: torch.cuda.Event,
@@ -287,10 +301,10 @@ def _emit_streaming_timeline(
     defer_started_ns = time.monotonic_ns()
     device = dispatch.x.device
     lane_events = tuple(dict(events) for events in lane_events)
-    # The workspace-backed live psum may already be reused lane-by-lane by a
-    # later generation while this off-thread collector is waiting.  Consume
-    # the generation-owned snapshot captured before each lane ACK instead.
-    expert_psum = expert_psum_snapshot.detach()
+    # The lane view owns this generation's packed control tensor, so later
+    # generations may reuse the symmetric ingress workspace without changing
+    # the psums consumed by this deferred collector.
+    expert_psum = dispatch.expert_psum.detach()
     source_topk_idx = dispatch.source_topk_idx.detach()
     generation = dispatch.generation
     input_tokens = source_topk_idx.size(0)
@@ -649,9 +663,6 @@ def _launch_streaming_moe_lanes(
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
     lane_timeline: list[dict[str, torch.cuda.Event]] = []
-    expert_psum_snapshot = (
-        torch.empty_like(dispatch.expert_psum) if timeline_enabled else None
-    )
     dispatch_done = None
     if timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
@@ -677,11 +688,10 @@ def _launch_streaming_moe_lanes(
             0, lane * metadata_capacity, metadata_capacity
         )
         with torch.cuda.stream(stream):
-            if expert_psum_snapshot is not None:
-                # Snapshot shared lane control before this lane's release lets
-                # generation g+1 reuse the workspace without corrupting the
-                # deferred diagnostic collector.  Keep it outside GEMM timing.
-                expert_psum_snapshot[lane].copy_(dispatch.expert_psum[lane])
+            # The wait observes this exact generation before its source is
+            # allowed to overwrite the shared ingress doorbell.  Packed data,
+            # counts, and psums are generation-owned from this point onward.
+            release_streaming_lane(lane, dispatch.generation)
             gemm_start = (
                 torch.cuda.Event(enable_timing=True) if timeline_enabled else None
             )
@@ -703,16 +713,14 @@ def _launch_streaming_moe_lanes(
             if return_start is not None:
                 return_start.record(stream)
             dispatch.buffer.streaming_combine_return(
-                lane_output[lane], metadata, lane, dispatch.generation
+                lane_output[lane],
+                metadata,
+                lane,
+                dispatch.generation,
             )
             if return_done is not None:
                 return_done.record(stream)
 
-            # combine-return still reads this lane's shared dispatch control
-            # fields.  Queue the ACK after it on the same stream so a fast
-            # lane can release its source ingress independently, without
-            # allowing generation g+1 to overwrite those fields too early.
-            release_streaming_lane(lane, dispatch.generation)
             lane_finalized = torch.cuda.Event()
             lane_finalized.record(stream)
             returned.append(lane_finalized)
@@ -760,10 +768,8 @@ def _launch_streaming_moe_lanes(
         epoch_drained.record(drain_stream)
 
     if timeline_enabled:
-        assert expert_psum_snapshot is not None
         _emit_streaming_timeline(
             dispatch,
-            expert_psum_snapshot,
             timeline_context,
             timeline_origin,
             dispatch_done,
