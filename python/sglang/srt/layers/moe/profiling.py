@@ -15,6 +15,7 @@ import os
 import queue
 import socket
 import threading
+import time
 import traceback
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
@@ -24,6 +25,7 @@ _ACTIVE_MOE_TIMELINE: ContextVar[Optional[dict[str, Any]]] = ContextVar(
 _COLLECTOR_LOCK = threading.Lock()
 _COLLECTOR_QUEUE: Optional[queue.Queue[Callable[[], None]]] = None
 _EVENT_GUARD_ENV = "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS"
+_CLOCK_ANCHOR_ATTEMPTS_ENV = "SGLANG_DEEPEP_TIMELINE_CLOCK_ANCHOR_ATTEMPTS"
 
 MOE_COMPONENT_PROFILE_SCHEMA = "async-moe-component-profile-v1"
 _EXECUTION_MODELS = frozenset(("staged", "streaming"))
@@ -324,6 +326,66 @@ def calibrated_event_timing_guard_ns() -> int:
     return guard_ns
 
 
+def cuda_clock_anchor_attempts() -> int:
+    """Return the bounded number of host/CUDA clock-anchor attempts."""
+
+    raw_value = os.getenv(_CLOCK_ANCHOR_ATTEMPTS_ENV, "8").strip()
+    try:
+        attempts = int(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            f"{_CLOCK_ANCHOR_ATTEMPTS_ENV} must be an integer"
+        ) from error
+    if not 1 <= attempts <= 64:
+        raise ValueError(
+            f"{_CLOCK_ANCHOR_ATTEMPTS_ENV} must be between 1 and 64"
+        )
+    return attempts
+
+
+def best_cuda_clock_anchor(
+    cuda: Any,
+    device: Any,
+    *,
+    attempts: Optional[int] = None,
+) -> dict[str, Any]:
+    """Bracket repeated CUDA anchors and retain the tightest valid one."""
+
+    attempt_count = cuda_clock_anchor_attempts() if attempts is None else attempts
+    if not 1 <= attempt_count <= 64:
+        raise ValueError("CUDA clock anchor attempts must be between 1 and 64")
+    profile_stream = cuda.Stream(device=device, priority=0)
+    candidates = []
+    for attempt in range(attempt_count):
+        anchor = cuda.Event(enable_timing=True)
+        bracket_start_ns = time.monotonic_ns()
+        anchor.record(profile_stream)
+        anchor.synchronize()
+        bracket_end_ns = time.monotonic_ns()
+        if bracket_end_ns < bracket_start_ns:
+            raise ValueError("CUDA anchor bracket end precedes its start")
+        candidates.append(
+            (
+                bracket_end_ns - bracket_start_ns,
+                attempt,
+                anchor,
+                bracket_start_ns,
+                bracket_end_ns,
+            )
+        )
+    width_ns, selected_attempt, anchor, start_ns, end_ns = min(candidates)
+    return {
+        "event": anchor,
+        "stream": profile_stream,
+        "bracket_start_ns": start_ns,
+        "bracket_end_ns": end_ns,
+        "selected_attempt": selected_attempt,
+        "attempts": attempt_count,
+        "bracket_widths_ns": [candidate[0] for candidate in candidates],
+        "selected_bracket_width_ns": width_ns,
+    }
+
+
 def cuda_event_host_interval(
     event: Any,
     anchor: Any,
@@ -485,9 +547,11 @@ def record_moe_timeline_event_after_wait(
 try:
     from profiler.moe_timeline import (  # noqa: E402,F401
         MOE_COMPONENT_PROFILE_SCHEMA,
+        best_cuda_clock_anchor,
         build_moe_component_profile,
         calibrated_event_timing_guard_ns,
         canonical_moe_profile_detail,
+        cuda_clock_anchor_attempts,
         cuda_event_host_interval,
         ensure_moe_timeline_collector,
         get_active_moe_timeline,

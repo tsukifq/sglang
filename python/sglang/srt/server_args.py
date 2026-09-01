@@ -1970,8 +1970,8 @@ class ServerArgs:
     enable_deepep_streaming: A[
         bool,
         "Enable the experimental inference-only lane-streaming DeepEP path. "
-        "The current milestone requires NVIDIA CUDA, TP8 with DP attention "
-        "and DP8, EP8/MoE-TP1, BF16 or block-FP8 experts, DeepGEMM, and "
+        "The current milestone requires NVIDIA CUDA, matching TP/DP/EP sizes "
+        "of 4 or 8 with DP attention and MoE-TP1, BF16 or block-FP8 experts, DeepGEMM, and "
         "DeepEP normal mode. CUDA graphs and shared-expert fusion are "
         "disabled automatically.",
     ] = False
@@ -5829,15 +5829,16 @@ class ServerArgs:
             raise ValueError(
                 "--enable-deepep-streaming requires --moe-a2a-backend deepep"
             )
-        if view.ep_size != 8 or self.tp_size != 8:
+        if view.ep_size not in (4, 8) or self.tp_size != view.ep_size:
             raise ValueError(
-                "--enable-deepep-streaming currently requires TP8 and EP8 "
+                "--enable-deepep-streaming requires matching TP/EP sizes "
+                "of 4 or 8 "
                 f"(got tp_size={self.tp_size}, ep_size={view.ep_size})"
             )
-        if not view.enable_dp_attention or self.dp_size != 8:
+        if not view.enable_dp_attention or self.dp_size != view.ep_size:
             raise ValueError(
-                "--enable-deepep-streaming currently requires "
-                "--enable-dp-attention --dp-size 8"
+                "--enable-deepep-streaming requires --enable-dp-attention "
+                "and matching DP/EP sizes"
             )
         if self.moe_dp_size != 1 or self.pp_size != 1:
             raise ValueError(
@@ -5903,15 +5904,10 @@ class ServerArgs:
                 checkpoint_quant_config = getattr(
                     text_config, "quantization_config", None
                 )
-            router_topk = getattr(text_config, "num_experts_per_tok", None)
             num_experts = getattr(text_config, "n_routed_experts", None)
             if num_experts is None:
                 num_experts = getattr(text_config, "num_experts", None)
-            if router_topk is not None and router_topk < 8:
-                raise ValueError(
-                    "--enable-deepep-streaming requires router top-k >= EP size"
-                )
-            if num_experts is not None and num_experts % 8 != 0:
+            if num_experts is not None and num_experts % view.ep_size != 0:
                 raise ValueError(
                     "--enable-deepep-streaming requires equal experts per EP rank"
                 )
@@ -5946,7 +5942,7 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DEEPEP_STREAMING.set(True)
         logger.warning(
             "Experimental lane-streaming DeepEP is enabled: normal mode, "
-            "DeepGEMM, EP8/MoE-TP1, and BF16/block-FP8 experts. CUDA graphs and "
+            "DeepGEMM, EP4/EP8 with MoE-TP1, and BF16/block-FP8 experts. CUDA graphs and "
             "shared-expert fusion are disabled."
         )
 

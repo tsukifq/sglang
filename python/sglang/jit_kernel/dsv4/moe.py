@@ -53,12 +53,13 @@ def _jit_silu_mul_quant_varlen_module(
     scale_ue8m0: bool,
     swizzle: bool,
     apply_swiglu_limit: bool,
+    use_pdl: bool,
 ):
     args = make_cpp_args(
         quant_group_size,
         scale_ue8m0,
         swizzle,
-        is_arch_support_pdl(),
+        use_pdl,
         apply_swiglu_limit,
     )
     return load_jit(
@@ -198,10 +199,13 @@ def silu_and_mul_masked_post_quant(
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    use_pdl: Optional[bool] = None,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
+    if use_pdl is None:
+        use_pdl = is_arch_support_pdl()
     module = _jit_silu_mul_quant_varlen_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit, use_pdl
     )
     module.run(
         input,

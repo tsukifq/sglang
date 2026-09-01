@@ -93,6 +93,7 @@ import torch
 import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_deepep_v2_baseline = get_bool_env_var("SGLANG_DEEPEP_V2_BASELINE")
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +346,7 @@ class DeepEPBuffer:
 
 
 class DeepEPStreamingBuffer:
-    """Process-wide ElasticBuffer used only by the experimental EP8 path."""
+    """Process-wide ElasticBuffer used only by the experimental EP4/EP8 path."""
 
     @classmethod
     def _state(cls):
@@ -482,9 +483,19 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        # DeepEP's legacy low-latency internode path uses FINISHED_SUM_TAG=1024
+        # and therefore requires the per-rank token capacity not to exceed it.
+        # Normal mode uses ElasticBuffer and has no dependency on that tag; in
+        # particular, DP-attention prefill on B200 can dispatch a 2048-token
+        # chunk per rank.
+        if (
+            self.deepep_mode == DeepEPMode.LOW_LATENCY
+            and self.num_max_dispatch_tokens_per_rank > 1024
+        ):
+            raise ValueError(
+                "DeepEP low-latency mode requires "
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK <= 1024"
+            )
 
         self.handle = None
 
@@ -605,6 +616,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        self._v2_input_num_tokens = None
 
     def dispatch_a(
         self,
@@ -613,6 +625,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        if _use_deepep_v2_baseline:
+            self._v2_input_num_tokens = hidden_states.shape[0]
+            if self._v2_input_num_tokens == 0:
+                # ElasticBuffer's direct kernel requires every EP rank to submit
+                # at least one source row. Use an unrouted sentinel on idle DP
+                # ranks, then remove it after combine so SGLang still observes
+                # an empty batch.
+                hidden_states = hidden_states.new_zeros((1, self.hidden_size))
+                topk_ids = topk_ids.new_full((1, self.router_topk), -1)
+                topk_weights = topk_weights.new_zeros((1, self.router_topk))
+
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -622,7 +645,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = (
+            ElasticBuffer.capture()
+            if _use_deepep_v2_baseline
+            else (Buffer.capture() if self.async_finish else None)
+        )
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
@@ -751,6 +778,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        if _use_deepep_v2_baseline:
+            return self._dispatch_core_v2(
+                x, topk_ids, topk_weights, previous_event
+            )
+
         buffer = self._get_buffer()
         (
             num_tokens_per_rank,
@@ -807,6 +839,47 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         )
 
+    def _dispatch_core_v2(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event,
+    ):
+        buffer = DeepEPStreamingBuffer.get_buffer(
+            self.group,
+            self.hidden_size,
+            self.router_topk,
+            self.num_max_dispatch_tokens_per_rank,
+            self.use_fp8,
+        )
+        _record_dispatch_input_ready(buffer, previous_event)
+        recv_x, recv_topk_ids, recv_topk_weights, handle, event = buffer.dispatch(
+            x,
+            topk_idx=topk_ids.contiguous(),
+            topk_weights=topk_weights.contiguous(),
+            num_experts=self.num_experts,
+            num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            previous_event=previous_event,
+            async_with_compute_stream=self.async_finish,
+            allocate_on_comm_stream=True,
+            do_handle_copy=True,
+            do_cpu_sync=True,
+            do_expand=False,
+            use_tma_aligned_col_major_sf=(
+                self.use_fp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            ),
+        )
+        self.handle = handle
+        return (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            handle.num_recv_tokens_per_expert_list,
+            event,
+        )
+
     def combine_a(
         self,
         hidden_states: torch.Tensor,
@@ -819,17 +892,46 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
-        previous_event = Buffer.capture() if self.async_finish else None
+        previous_event = (
+            ElasticBuffer.capture()
+            if _use_deepep_v2_baseline
+            else (Buffer.capture() if self.async_finish else None)
+        )
         return output, previous_event
 
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        if _use_deepep_v2_baseline:
+            if self._v2_input_num_tokens is None:
+                raise RuntimeError("DeepEP V2 combine has no matching dispatch")
+            hidden_states = hidden_states[: self._v2_input_num_tokens]
+            self._v2_input_num_tokens = None
         self.handle = None
         self.src2dst = None
         return hidden_states
 
+    def _combine_core_v2(self, x: torch.Tensor, previous_event):
+        buffer = DeepEPStreamingBuffer.get_buffer(
+            self.group,
+            self.hidden_size,
+            self.router_topk,
+            self.num_max_dispatch_tokens_per_rank,
+            self.use_fp8,
+        )
+        combined_x, _, event = buffer.combine(
+            x,
+            self.handle,
+            previous_event=previous_event,
+            async_with_compute_stream=self.async_finish,
+            allocate_on_comm_stream=True,
+        )
+        return combined_x, event
+
     def _combine_core(self, x: torch.Tensor, previous_event):
+        if _use_deepep_v2_baseline:
+            return self._combine_core_v2(x, previous_event)
+
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
@@ -1100,11 +1202,10 @@ class DeepEPDispatcher(BaseDispatcher):
                     "streaming DeepEP requires --deepep-mode normal; auto resolves "
                     "decode to the incompatible low-latency transport"
                 )
-            self.streaming_num_wavefront_slots = 2 if is_tbo_enabled() else 1
-            if group.size() != 8:
-                raise ValueError("streaming DeepEP is currently restricted to EP8")
-            if router_topk < group.size():
-                raise ValueError("streaming DeepEP requires top-k >= EP size")
+            if group.size() not in (4, 8):
+                raise ValueError(
+                    "streaming DeepEP currently supports EP4 or EP8"
+                )
             if num_experts % group.size() != 0:
                 raise ValueError("streaming DeepEP requires equal experts per EP rank")
             if params_dtype != torch.bfloat16:

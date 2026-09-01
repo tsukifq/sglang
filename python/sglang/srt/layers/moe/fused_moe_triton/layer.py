@@ -45,6 +45,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 )
 from sglang.srt.layers.moe.profiling import (
     build_moe_component_profile,
+    best_cuda_clock_anchor,
     calibrated_event_timing_guard_ns,
     cuda_event_host_interval,
     ensure_moe_timeline_collector,
@@ -172,6 +173,14 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
+
+# DeepEP transport sidecars can outlive the Python call that submitted them.
+# Reap them process-wide so a completed generation from an earlier model layer
+# is released promptly instead of pinning one lane-capacity allocation per MoE
+# layer until the next batch reaches that same layer.
+_deepep_streaming_global_inflight: list[DeepEPStreamingLayerResult] = []
+_DEEPEP_STREAMING_GENERATION_GRACE = 4
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -388,8 +397,10 @@ class FusedMoE(torch.nn.Module):
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
         self._deepep_streaming_streams = {}
         self._deepep_streaming_drain_streams = {}
+        self._deepep_streaming_activation_streams = {}
         self._deepep_streaming_inflight = {}
         self._deepep_streaming_fp8 = False
+        self._deepep_streaming_fp4 = False
         self._deepep_timeline_calls = 0
         self._deepep_timeline_target_call = 0
         self._deepep_timeline_call_stride = 0
@@ -520,11 +531,11 @@ class FusedMoE(torch.nn.Module):
         return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
 
     def _validate_deepep_streaming(self) -> None:
-        """Fail closed for model shapes not covered by the EP8 milestone."""
+        """Fail closed for model shapes not covered by the EP4/EP8 milestone."""
 
         unsupported = []
-        if self.moe_ep_size != 8 or self.moe_tp_size != 1:
-            unsupported.append("EP8 with MoE TP1")
+        if self.moe_ep_size not in (4, 8) or self.moe_tp_size != 1:
+            unsupported.append("EP4 or EP8 with MoE TP1")
         if not self.use_deep_gemm:
             unsupported.append("--moe-runner-backend deep_gemm")
         if self.quant_config is None:
@@ -535,14 +546,22 @@ class FusedMoE(torch.nn.Module):
                 unsupported.append("BF16 W13/W2 weights")
         elif isinstance(self.quant_method, Fp8MoEMethod):
             self._deepep_streaming_fp8 = True
+            self._deepep_streaming_fp4 = self.quant_method.is_fp4_expert
             if (
                 not self.quant_method.block_quant
                 or tuple(self.quant_method.weight_block_size or ()) != (128, 128)
                 or self.quant_method.use_mxfp8
-                or self.quant_method.is_fp4_expert
             ):
-                unsupported.append("dynamic block-FP8 [128, 128] experts")
-            if (
+                unsupported.append(
+                    "dynamic block-FP8 or DSV4 MXFP4 experts"
+                )
+            if self._deepep_streaming_fp4:
+                if (
+                    self.w13_weight.dtype != torch.int8
+                    or self.w2_weight.dtype != torch.int8
+                ):
+                    unsupported.append("packed int8 DSV4 MXFP4 W13/W2 weights")
+            elif (
                 self.w13_weight.dtype != torch.float8_e4m3fn
                 or self.w2_weight.dtype != torch.float8_e4m3fn
             ):
@@ -551,11 +570,13 @@ class FusedMoE(torch.nn.Module):
                 self.w13_weight_scale_inv.dtype != torch.float32
                 or self.w2_weight_scale_inv.dtype != torch.float32
             ):
-                unsupported.append("float32 block-FP8 weight scales")
+                unsupported.append("float32 pre-load expert weight scales")
             if self.quant_method.quant_config.activation_scheme != "dynamic":
                 unsupported.append("dynamic FP8 activation scaling")
         else:
-            unsupported.append("BF16 or block-FP8 expert quantization")
+            unsupported.append(
+                "BF16, block-FP8, or DSV4 MXFP4 expert quantization"
+            )
         if self.num_fused_shared_experts != 0:
             unsupported.append("shared-expert fusion disabled")
         if self.reduce_results:
@@ -572,12 +593,11 @@ class FusedMoE(torch.nn.Module):
         if any(
             value is not None
             for value in (
-                self.moe_runner_config.swiglu_limit,
                 self.moe_runner_config.gemm1_alpha,
                 self.moe_runner_config.gemm1_clamp_limit,
             )
         ):
-            unsupported.append("unclamped standard SwiGLU")
+            unsupported.append("no GEMM1 alpha or clamp variant")
         if unsupported:
             raise ValueError(
                 "SGLANG_ENABLE_DEEPEP_STREAMING currently requires: "
@@ -648,12 +668,11 @@ class FusedMoE(torch.nn.Module):
             with torch.cuda.device(device):
                 output_ready.synchronize()
                 output_wait_done_ns = time.monotonic_ns()
-                profile_stream = torch.cuda.Stream(device=device, priority=0)
-                clock_anchor = torch.cuda.Event(enable_timing=True)
-                anchor_bracket_start_ns = time.monotonic_ns()
-                clock_anchor.record(profile_stream)
-                clock_anchor.synchronize()
-                anchor_bracket_end_ns = time.monotonic_ns()
+                anchor_selection = best_cuda_clock_anchor(torch.cuda, device)
+                profile_stream = anchor_selection["stream"]
+                clock_anchor = anchor_selection["event"]
+                anchor_bracket_start_ns = anchor_selection["bracket_start_ns"]
+                anchor_bracket_end_ns = anchor_selection["bracket_end_ns"]
 
             anchor_midpoint_ns = (
                 anchor_bracket_start_ns + anchor_bracket_end_ns
@@ -738,12 +757,19 @@ class FusedMoE(torch.nn.Module):
                 },
                 "clock_alignment": {
                     "method": (
-                        "bracketed private-stream CUDA anchor projected to host "
-                        "CLOCK_MONOTONIC"
+                        "minimum-width repeated private-stream CUDA anchor "
+                        "projected to host CLOCK_MONOTONIC"
                     ),
                     "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
                     "anchor_bracket_start_ns": anchor_bracket_start_ns,
                     "anchor_bracket_end_ns": anchor_bracket_end_ns,
+                    "anchor_attempts": anchor_selection["attempts"],
+                    "anchor_selected_attempt": anchor_selection[
+                        "selected_attempt"
+                    ],
+                    "anchor_bracket_widths_ns": anchor_selection[
+                        "bracket_widths_ns"
+                    ],
                     "uncertainty_ns": (
                         anchor_bracket_end_ns - anchor_bracket_start_ns + 1
                     )
@@ -839,12 +865,11 @@ class FusedMoE(torch.nn.Module):
                 # The serving stream is never synchronized. Once its output
                 # event is complete, calibrate on a private idle stream so
                 # later serving work cannot move the host-clock anchor.
-                profile_stream = torch.cuda.Stream(device=device, priority=0)
-                clock_anchor = torch.cuda.Event(enable_timing=True)
-                anchor_bracket_start_ns = time.monotonic_ns()
-                clock_anchor.record(profile_stream)
-                clock_anchor.synchronize()
-                anchor_bracket_end_ns = time.monotonic_ns()
+                anchor_selection = best_cuda_clock_anchor(torch.cuda, device)
+                profile_stream = anchor_selection["stream"]
+                clock_anchor = anchor_selection["event"]
+                anchor_bracket_start_ns = anchor_selection["bracket_start_ns"]
+                anchor_bracket_end_ns = anchor_selection["bracket_end_ns"]
 
                 topk_ids_host = None
                 metadata_d2h_bytes = 0
@@ -1140,12 +1165,19 @@ class FusedMoE(torch.nn.Module):
                 },
                 "clock_alignment": {
                     "method": (
-                        "bracketed private-stream CUDA anchor projected to host "
-                        "CLOCK_MONOTONIC"
+                        "minimum-width repeated private-stream CUDA anchor "
+                        "projected to host CLOCK_MONOTONIC"
                     ),
                     "anchor_host_monotonic_ns_midpoint": anchor_midpoint_ns,
                     "anchor_bracket_start_ns": anchor_bracket_start_ns,
                     "anchor_bracket_end_ns": anchor_bracket_end_ns,
+                    "anchor_attempts": anchor_selection["attempts"],
+                    "anchor_selected_attempt": anchor_selection[
+                        "selected_attempt"
+                    ],
+                    "anchor_bracket_widths_ns": anchor_selection[
+                        "bracket_widths_ns"
+                    ],
                     "uncertainty_ns": (
                         anchor_bracket_end_ns - anchor_bracket_start_ns + 1
                     )
@@ -1198,6 +1230,22 @@ class FusedMoE(torch.nn.Module):
             raise ValueError("streaming DeepEP requires standard top-k output")
         if torch.is_grad_enabled():
             raise RuntimeError("streaming DeepEP is inference-only")
+        global _deepep_streaming_global_inflight
+        # The shared ElasticBuffer's next dispatch consumes generation-1 reuse
+        # state. Keep a short completed-generation grace window so transport
+        # handles outlive that device-side protocol step; older generations are
+        # released as soon as their GPU lifetime fence is complete.
+        grace_start = max(
+            0,
+            len(_deepep_streaming_global_inflight)
+            - _DEEPEP_STREAMING_GENERATION_GRACE,
+        )
+        _deepep_streaming_global_inflight[:] = [
+            pending
+            for index, pending in enumerate(_deepep_streaming_global_inflight)
+            if index >= grace_start or not pending.epoch_drained.query()
+        ]
+        wavefront_slot = 0
         timeline_origin = None
         dispatch_timeline = None
         if timeline_context is not None:
@@ -1215,6 +1263,7 @@ class FusedMoE(torch.nn.Module):
             dispatch = self.dispatcher.dispatch_streaming(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
+                wavefront_slot=wavefront_slot,
             )
         return self._run_deepep_streaming_dispatch(
             dispatch,
@@ -1239,8 +1288,12 @@ class FusedMoE(torch.nn.Module):
             self._deepep_streaming_drain_streams[wavefront_slot] = (
                 torch.cuda.Stream(priority=0)
             )
+            self._deepep_streaming_activation_streams[wavefront_slot] = (
+                torch.cuda.Stream(priority=0)
+            )
         lane_streams = self._deepep_streaming_streams[wavefront_slot]
         drain_stream = self._deepep_streaming_drain_streams[wavefront_slot]
+        activation_stream = self._deepep_streaming_activation_streams[wavefront_slot]
         if self._deepep_streaming_fp8:
             result = launch_fp8_streaming_moe(
                 dispatch,
@@ -1249,8 +1302,11 @@ class FusedMoE(torch.nn.Module):
                 self.w13_weight_scale_inv,
                 self.w2_weight_scale_inv,
                 self.quant_method.weight_block_size,
+                is_fp4_expert=self._deepep_streaming_fp4,
                 streams=lane_streams,
                 drain_stream=drain_stream,
+                activation_stream=activation_stream,
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
                 timeline_context=timeline_context,
                 timeline_origin=timeline_origin,
             )
@@ -1261,13 +1317,14 @@ class FusedMoE(torch.nn.Module):
                 self.w2_weight,
                 streams=lane_streams,
                 drain_stream=drain_stream,
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
                 timeline_context=timeline_context,
                 timeline_origin=timeline_origin,
             )
-        # Retain events, transport handle, and sidecar tensors until this layer's
-        # next invocation. DeepEP gates remote ingress reuse with per-lane ACKs;
-        # the drain event here protects only local tensor/event lifetime.
-        self._deepep_streaming_inflight[wavefront_slot] = result
+        # Retain the full result globally only until GPU consumers finish;
+        # retain just the ordering fence on the layer itself.
+        _deepep_streaming_global_inflight.append(result)
+        self._deepep_streaming_inflight[wavefront_slot] = result.epoch_drained
         return result
 
     def _load_per_tensor_weight_scale(

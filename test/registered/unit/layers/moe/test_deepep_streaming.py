@@ -3,14 +3,17 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.batch_overlap.operations import _resolve_tbo_child_contexts
+from sglang.srt.layers.moe.deepep_streaming_kernels import masked_route_weight_mul_
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
     _require_per_lane_release,
     configure_deepep_streaming_environment,
+    is_deepep_v2_sync_baseline_enabled,
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
 )
@@ -75,6 +78,19 @@ def test_tbo_children_receive_distinct_moe_wavefront_slots():
         assert get_moe_wavefront_slot() == 1
 
 
+def test_v2_sync_baseline_gate_is_explicit(monkeypatch):
+    monkeypatch.delenv("SGLANG_DEEPEP_V2_SYNC_BASELINE", raising=False)
+    assert not is_deepep_v2_sync_baseline_enabled()
+    monkeypatch.setenv("SGLANG_DEEPEP_V2_SYNC_BASELINE", "1")
+    assert is_deepep_v2_sync_baseline_enabled()
+
+    source = inspect.getsource(_launch_streaming_moe_lanes)
+    all_lane_wait = source.index("for lane in range(lanes):")
+    barrier_event = source.index("all_lanes_ready.record(source_stream)")
+    lane_compute = source.index("lane_compute(lane, lane_output[lane])")
+    assert all_lane_wait < barrier_event < lane_compute
+
+
 def test_streaming_dispatch_rejects_incomplete_runtime_view():
     with pytest.raises(ValueError, match="seven DeepEP lane-view fields"):
         DeepEPStreamingDispatch.from_runtime(
@@ -86,17 +102,19 @@ def test_streaming_dispatch_rejects_incomplete_runtime_view():
         )
 
 
-def test_streaming_layer_keeps_dependencies_on_device():
+def test_streaming_layer_gates_sm100_transport_before_lane_consumers():
     source = inspect.getsource(_launch_streaming_moe_lanes)
     assert "cuStreamWaitValue64" in source
     assert "streaming_combine_return" in source
     assert "streaming_combine_reduce" in source
     assert "release_streaming_lane(lane, dispatch.generation)" in source
+    assert "host_lane_gate" in source
+    assert "lane_ready_events[lane].query()" in source
     assert ".synchronize(" not in source
     assert ".barrier(" not in source
 
 
-def test_streaming_lane_ack_is_ordered_after_pack_wait_and_before_gemm():
+def test_streaming_lane_ack_is_ordered_after_combine_return_submission():
     source = inspect.getsource(_launch_streaming_moe_lanes)
 
     pack_wait = source.index("cuStreamWaitValue64")
@@ -104,7 +122,7 @@ def test_streaming_lane_ack_is_ordered_after_pack_wait_and_before_gemm():
     lane_compute = source.index("lane_compute(lane, lane_output[lane])")
     combine_return = source.index("dispatch.buffer.streaming_combine_return(")
 
-    assert pack_wait < release_lane < lane_compute < combine_return
+    assert pack_wait < lane_compute < combine_return < release_lane
 
 
 def test_streaming_generation_owned_control_removes_deferred_psum_copy():
@@ -298,17 +316,44 @@ def test_timeline_decodes_aligned_lane_psum_without_counting_holes():
 
 
 def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
+    signature = inspect.signature(launch_fp8_streaming_moe)
+    assert signature.parameters["swiglu_limit"].default is None
+    assert signature.parameters["is_fp4_expert"].default is False
+
     source = inspect.getsource(launch_fp8_streaming_moe)
-    assert source.count("m_grouped_fp8_gemm_nt_contiguous") == 2
-    assert source.count("use_psum_layout=True") == 2
+    assert source.count("m_grouped_fp8_gemm_nt_contiguous") == 4
+    assert source.count("use_psum_layout=True") == 4
     assert "fuse_silu_and_mul=True" in source
+    assert "silu_and_mul_clamp(gate_up[lane], down_input[lane], swiglu_limit)" in source
+    assert "fuse_silu_and_mul=False" in source
+    assert "silu_and_mul_contig_post_quant" not in source
+    assert "swiglu_limit=swiglu_limit" in source
+    assert '"recipe_a": (1, 128)' in source
+    assert '"recipe_b": (1, 32)' in source
     assert "m_indices" not in source
     assert "shadow" in source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_masked_route_weight_mul_preserves_inactive_tail():
+    output = torch.arange(32, dtype=torch.float32, device="cuda").reshape(8, 4)
+    original = output.clone()
+    route_weights = torch.linspace(0.5, 1.5, 8, device="cuda")
+    active_rows = torch.tensor([3], dtype=torch.int32, device="cuda")
+
+    masked_route_weight_mul_(output, route_weights, active_rows)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        output[:3], original[:3] * route_weights[:3, None]
+    )
+    torch.testing.assert_close(output[3:], original[3:])
 
 
 def test_bf16_streaming_forwards_per_expert_shape_hint_to_both_gemms():
     signature = inspect.signature(launch_bf16_streaming_moe)
     assert signature.parameters["expected_m_per_expert"].default is None
+    assert signature.parameters["swiglu_limit"].default is None
 
     source = inspect.getsource(launch_bf16_streaming_moe)
     assert source.count(
