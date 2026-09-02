@@ -116,6 +116,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    use_psum_layout: bool = False,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -128,6 +130,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(rhs)
 
     fp4_kwargs = {}
+    if use_psum_layout:
+        fp4_kwargs["use_psum_layout"] = True
+        if expected_m_for_psum_layout is not None:
+            fp4_kwargs["expected_m_for_psum_layout"] = expected_m_for_psum_layout
     if recipe_a is not None:
         fp4_kwargs["recipe_a"] = recipe_a
     if recipe_b is not None:
@@ -140,14 +146,27 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
 
 def grouped_gemm_nt_bf16_contig(
-    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    use_psum_layout: bool = False,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
+    psum_kwargs = {}
+    if use_psum_layout:
+        psum_kwargs["use_psum_layout"] = True
+        if expected_m_for_psum_layout is not None:
+            psum_kwargs["expected_m_for_psum_layout"] = expected_m_for_psum_layout
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            a, b, d, m_indices, **psum_kwargs
+        )
 
 
 def gemm_nt_f8f8bf16(

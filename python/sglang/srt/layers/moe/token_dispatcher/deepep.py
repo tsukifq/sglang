@@ -94,6 +94,8 @@ import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_deepep_v2_baseline = get_bool_env_var("SGLANG_DEEPEP_V2_BASELINE")
+_use_deepep_rank_ready = get_bool_env_var("SGLANG_DEEPEP_RANK_READY")
+_use_deepep_elastic = _use_deepep_v2_baseline or _use_deepep_rank_ready
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,7 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    num_recv_tokens_per_expert: Union[List[int], torch.Tensor]
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -625,7 +627,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if _use_deepep_v2_baseline:
+        if _use_deepep_elastic:
             self._v2_input_num_tokens = hidden_states.shape[0]
             if self._v2_input_num_tokens == 0:
                 # ElasticBuffer's direct kernel requires every EP rank to submit
@@ -647,7 +649,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             )
         previous_event = (
             ElasticBuffer.capture()
-            if _use_deepep_v2_baseline
+            if _use_deepep_elastic
             else (Buffer.capture() if self.async_finish else None)
         )
         return hidden_states, topk_ids, topk_weights, previous_event
@@ -778,7 +780,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
-        if _use_deepep_v2_baseline:
+        if _use_deepep_elastic:
             return self._dispatch_core_v2(
                 x, topk_ids, topk_weights, previous_event
             )
@@ -846,6 +848,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        if _use_deepep_rank_ready and not get_bool_env_var(
+            "EP_EXPERIMENTAL_RANK_READY"
+        ):
+            raise RuntimeError(
+                "SGLANG_DEEPEP_RANK_READY requires EP_EXPERIMENTAL_RANK_READY=1"
+            )
+
         buffer = DeepEPStreamingBuffer.get_buffer(
             self.group,
             self.hidden_size,
@@ -865,8 +874,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_with_compute_stream=self.async_finish,
             allocate_on_comm_stream=True,
             do_handle_copy=True,
-            do_cpu_sync=True,
-            do_expand=False,
+            do_cpu_sync=not _use_deepep_rank_ready,
+            do_expand=_use_deepep_rank_ready,
+            do_zero_padding=False,
             use_tma_aligned_col_major_sf=(
                 self.use_fp8 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             ),
@@ -876,7 +886,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             recv_x,
             recv_topk_ids,
             recv_topk_weights,
-            handle.num_recv_tokens_per_expert_list,
+            (
+                handle.psum_num_recv_tokens_per_expert
+                if _use_deepep_rank_ready
+                else handle.num_recv_tokens_per_expert_list
+            ),
             event,
         )
 
@@ -894,7 +908,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         previous_event = (
             ElasticBuffer.capture()
-            if _use_deepep_v2_baseline
+            if _use_deepep_elastic
             else (Buffer.capture() if self.async_finish else None)
         )
         return output, previous_event
@@ -902,7 +916,25 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        if _use_deepep_v2_baseline:
+        if _use_deepep_rank_ready and get_bool_env_var(
+            "EP_EXPERIMENTAL_ASYNC_COMBINE_ENTRY"
+        ):
+            # The removed entry barrier also protected the single symmetric
+            # combine buffer from cross-generation reuse. Re-establish that
+            # convergence after the reduce epilogue, where it is the intended
+            # inter-layer synchronization instead of a combine-entry stall.
+            buffer = DeepEPStreamingBuffer.get_buffer(
+                self.group,
+                self.hidden_size,
+                self.router_topk,
+                self.num_max_dispatch_tokens_per_rank,
+                self.use_fp8,
+            )
+            buffer.barrier(
+                use_comm_stream=True, with_cpu_sync=False, sequential=True
+            )
+            torch.cuda.current_stream().synchronize()
+        if _use_deepep_elastic:
             if self._v2_input_num_tokens is None:
                 raise RuntimeError("DeepEP V2 combine has no matching dispatch")
             hidden_states = hidden_states[: self._v2_input_num_tokens]
@@ -929,7 +961,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _combine_core(self, x: torch.Tensor, previous_event):
-        if _use_deepep_v2_baseline:
+        if _use_deepep_elastic:
             return self._combine_core_v2(x, previous_event)
 
         buffer = self._get_buffer()

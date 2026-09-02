@@ -142,6 +142,8 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    use_psum_layout: bool = False
+    expected_m_for_psum_layout: Optional[int] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -276,6 +278,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
         )
         record_moe_timeline_event("w13_done")
 
@@ -369,6 +373,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
         )
         record_moe_timeline_event("w2_done")
 
@@ -412,6 +418,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight,
             gateup_output,
             m_indices,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
         )
         record_moe_timeline_event("w13_done")
 
@@ -449,6 +457,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight,
             down_output,
             m_indices,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m_for_psum_layout,
         )
         record_moe_timeline_event("w2_done")
 
@@ -896,6 +906,37 @@ def pre_permute_deepep_normal_to_deep_gemm(
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
+    if isinstance(num_recv_tokens_per_expert, torch.Tensor):
+        expert_psum = num_recv_tokens_per_expert
+        if (
+            expert_psum.ndim != 1
+            or expert_psum.dtype != torch.int32
+            or not expert_psum.is_cuda
+            or not expert_psum.is_contiguous()
+        ):
+            raise ValueError(
+                "rank-ready DeepEP requires a contiguous CUDA int32 expert psum"
+            )
+        if hidden_states.shape[0] == 0:
+            raise ValueError("rank-ready DeepEP requires a non-empty expanded buffer")
+
+        running_state["rank_ready_layout"] = True
+        running_state["all_tokens"] = hidden_states.shape[0]
+        running_state["expert_rows"] = ()
+        running_state["hidden_states_shape"] = hidden_states.shape
+        running_state["hidden_states_device"] = hidden_states.device
+        running_state["hidden_states_dtype"] = hidden_states.dtype
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=expert_psum,
+            use_psum_layout=True,
+        )
+
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
     running_state["expert_rows"] = list(num_recv_tokens_per_expert)
@@ -979,8 +1020,16 @@ def post_permute_deep_gemm_to_deepep_normal(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
+    if running_state.get("rank_ready_layout", False):
+        return DeepEPNormalCombineInput(
+            hidden_states=runner_output.hidden_states,
+            topk_ids=running_state["topk_ids"],
+            topk_weights=running_state["topk_weights"],
+        )
+
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
