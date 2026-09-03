@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.jit_kernel.dsv4 import (
+    silu_and_mul_masked_post_quant,
+    silu_and_mul_psum_post_quant,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -286,7 +289,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        # Psum layout is the rank-ready expanded buffer.  Its physical M is a
+        # capacity bound with expert-alignment holes, so the legacy full-span
+        # activation/quant path is both wasteful and semantically the wrong
+        # domain even when the general mega-MoE optimization flag is off.
+        if (
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get()
+            or runner_input.use_psum_layout
+        ):
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -303,16 +313,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
             record_moe_timeline_event("activation_start")
-            silu_and_mul_contig_post_quant(
-                input=gateup_output,
-                output=down_input_fp8,
-                output_scale=down_input_scale,
-                quant_group_size=scale_block_size,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                swiglu_limit=swiglu_limit_arg,
-                swizzle=self.use_swizzle,
-            )
+            if runner_input.use_psum_layout:
+                if m_indices is None:
+                    raise ValueError("psum-layout activation requires expert psum")
+                silu_and_mul_psum_post_quant(
+                    input=gateup_output,
+                    output=down_input_fp8,
+                    output_scale=down_input_scale,
+                    quant_group_size=scale_block_size,
+                    expert_psum=m_indices,
+                    expert_alignment=128,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    swiglu_limit=swiglu_limit_arg,
+                    swizzle=self.use_swizzle,
+                )
+            else:
+                silu_and_mul_contig_post_quant(
+                    input=gateup_output,
+                    output=down_input_fp8,
+                    output_scale=down_input_scale,
+                    quant_group_size=scale_block_size,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    swiglu_limit=swiglu_limit_arg,
+                    swizzle=self.use_swizzle,
+                )
             record_moe_timeline_event("activation_done")
             del gateup_output
         else:

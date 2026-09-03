@@ -95,6 +95,30 @@ def _jit_silu_mul_quant_contig_module(
 
 
 @cache_once
+def _jit_silu_mul_quant_psum_module(
+    quant_group_size: int,
+    scale_ue8m0: bool,
+    swizzle: bool,
+    apply_swiglu_limit: bool,
+    use_pdl: bool,
+):
+    args = make_cpp_args(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        use_pdl,
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        make_name("silu_mul_quant_psum"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulPsumPostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
@@ -236,6 +260,48 @@ def silu_and_mul_contig_post_quant(
         input,
         output,
         output_scale,
+        transposed,
+        float(swiglu_limit) if apply_swiglu_limit else 0.0,
+    )
+
+
+def silu_and_mul_psum_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    expert_psum: torch.Tensor,
+    expert_alignment: int = 128,
+    scale_ue8m0: bool = False,
+    transposed: bool = False,
+    swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
+    use_pdl: bool = False,
+) -> None:
+    """Activate only valid rows in an aligned expert prefix-sum layout.
+
+    ``expert_psum[e]`` is the exclusive end of expert ``e``.  Its start is
+    zero for the first expert and ``align(expert_psum[e - 1])`` afterwards.
+    Padding rows remain untouched because psum-aware grouped GEMMs skip them.
+
+    PDL stays disabled by default: the persistent CTA grid does not preserve
+    the one-CTA-per-row dependency mapping used by the contiguous kernel.
+    """
+
+    apply_swiglu_limit = swiglu_limit is not None
+    module = _jit_silu_mul_quant_psum_module(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        apply_swiglu_limit,
+        use_pdl,
+    )
+    module.run(
+        input,
+        output,
+        output_scale,
+        expert_psum,
+        expert_alignment,
         transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )

@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -373,6 +374,163 @@ struct SiluMulQuantContigParams {
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
 };
 
+struct SiluMulQuantPsumParams {
+  const bf16_t* __restrict__ input;
+  fp8_e4m3_t* __restrict__ output;
+  float* __restrict__ output_scale;
+  const int32_t* __restrict__ expert_psum;
+  float swiglu_limit;  // only read when kApplySwigluLimit=true
+  int64_t hidden_dim;
+  uint32_t num_tokens;
+  uint32_t num_experts;
+  uint32_t expert_alignment;
+  uint32_t scale_row_stride_int32;  // only used when kTransposed=true
+};
+
+SGL_DEVICE uint32_t align_psum_row(uint32_t value, uint32_t alignment) {
+  return (value + alignment - 1u) / alignment * alignment;
+}
+
+template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+__global__ __launch_bounds__(1024, 2) void
+    silu_mul_quant_psum_kernel(const SiluMulQuantPsumParams __grid_constant__ params) {
+  using namespace device;
+
+  constexpr uint32_t kGroupSize = 128u;
+  constexpr uint32_t kWorkThreads = 16u;
+  using InputVec = AlignedVector<bf16x2_t, 4>;
+  using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
+  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
+
+  // DeepEP stores an exclusive valid end for every expert.  The next expert
+  // starts at align(previous_end), so the physical tensor contains gaps that
+  // must not be activated or quantized.  Build a compact active-work prefix
+  // once per persistent CTA, then map compact work ids back to physical rows.
+  __shared__ uint32_t expert_starts[kMaxExperts];
+  __shared__ uint32_t active_ends[kMaxExperts];
+  __shared__ uint32_t current_row;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const uint32_t tx = threadIdx.x;
+  if (tx < params.num_experts) {
+    const int32_t previous_end_raw =
+        tx == 0 ? 0 : params.expert_psum[tx - 1];
+    const uint32_t previous_end =
+        previous_end_raw >= 0 ? static_cast<uint32_t>(previous_end_raw) : 0u;
+    const uint32_t start =
+        tx == 0 ? 0u : align_psum_row(previous_end, params.expert_alignment);
+    expert_starts[tx] = start;
+  }
+  __syncthreads();
+
+  if (tx == 0) {
+    uint32_t active_prefix = 0;
+    for (uint32_t expert = 0; expert < params.num_experts; ++expert) {
+      const uint32_t start = expert_starts[expert];
+      const int32_t end_raw = params.expert_psum[expert];
+      const uint32_t end =
+          end_raw >= 0 ? static_cast<uint32_t>(end_raw) : start;
+      // A malformed or not-yet-published psum produces no work instead of an
+      // out-of-bounds access.  Normal stream ordering guarantees end >= start.
+      active_prefix += end >= start ? end - start : 0u;
+      active_ends[expert] = active_prefix;
+    }
+  }
+  __syncthreads();
+
+  const uint32_t total_active = active_ends[params.num_experts - 1];
+  for (uint32_t active_id = blockIdx.x; active_id < total_active;
+       active_id += gridDim.x) {
+    if (tx == 0) {
+      uint32_t expert = 0;
+      while (expert + 1 < params.num_experts &&
+             active_id >= active_ends[expert]) {
+        ++expert;
+      }
+      const uint32_t previous_active_end =
+          expert == 0 ? 0u : active_ends[expert - 1];
+      current_row = expert_starts[expert] + active_id - previous_active_end;
+    }
+    __syncthreads();
+
+    const uint32_t token_id = current_row;
+    if (token_id >= params.num_tokens) break;
+    const uint32_t work_id = tx / kWorkThreads;
+
+    const auto input = params.input + token_id * params.hidden_dim * 2;
+    const auto output = params.output + token_id * params.hidden_dim;
+    [[maybe_unused]] const auto output_scale = [&] {
+      const auto num_groups = params.hidden_dim / kGroupSize;
+      if constexpr (kTransposed) {
+        const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
+        return base + (work_id / 4u) *
+                          (params.scale_row_stride_int32 * 4u) +
+               token_id * 4u + (work_id % 4u);
+      } else {
+        return params.output_scale + token_id * num_groups + work_id;
+      }
+    }();
+
+    InputVec gate_vec, up_vec;
+    if constexpr (kSwizzle) {
+      gate_vec.load(input, tx * 2);
+      up_vec.load(input, tx * 2 + 1);
+    } else {
+      gate_vec.load(input, tx);
+      up_vec.load(input, tx + blockDim.x);
+    }
+
+    float local_max = 0.0f;
+    float results[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      const auto [x, y] = silu_and_mul<kApplySwigluLimit>(
+          gate_vec[i], up_vec[i], params.swiglu_limit);
+      results[2 * i + 0] = x;
+      results[2 * i + 1] = y;
+      local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
+    }
+
+    local_max = warp::reduce_max<kWorkThreads>(local_max);
+    const float absmax = fmaxf(local_max, 1e-10f);
+    float scale;
+    uint32_t ue8m0_exp;
+    if constexpr (kScaleUE8M0) {
+      const float raw_scale = absmax / math::FP8_E4M3_MAX;
+      ue8m0_exp = cast_to_ue8m0(raw_scale);
+      scale = __uint_as_float(ue8m0_exp << 23);
+    } else {
+      scale = absmax / math::FP8_E4M3_MAX;
+    }
+    const auto inv_scale = 1.0f / scale;
+
+    OutputVec out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      out_vec[i] = pack_fp8(
+          results[2 * i + 0] * inv_scale,
+          results[2 * i + 1] * inv_scale);
+    }
+    out_vec.store(output, tx);
+    if constexpr (kTransposed) {
+      *output_scale = ue8m0_exp;
+    } else {
+      *output_scale = scale;
+    }
+
+    // current_row is CTA-shared and may only advance after every vector store
+    // from the current active row has retired.
+    __syncthreads();
+  }
+
+  // The initial implementation deliberately compiles with PDL disabled.  If
+  // enabled later, only signal after this persistent CTA has drained all of
+  // its strided work because W2 uses a different grouped-GEMM scheduler.
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
@@ -533,6 +691,113 @@ struct SiluAndMulContigPostQuantKernel {
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+struct SiluAndMulPsumPostQuantKernel {
+  static_assert(kGroupSize == 128);
+  static constexpr auto kernel_normal =
+      silu_mul_quant_psum_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+  static constexpr auto kernel_transposed =
+      silu_mul_quant_psum_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView output_scale,
+      const tvm::ffi::TensorView expert_psum,
+      const uint32_t expert_alignment,
+      const bool transposed,
+      const double swiglu_limit) {
+    using namespace host;
+
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens_padded"};
+    auto D = SymbolicSize{"hidden_dim x 2"};
+    auto N = SymbolicSize{"hidden_dim"};
+    auto E = SymbolicSize{"num_experts"};
+    auto G = SymbolicSize{"num_groups"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, D})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({M, N})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output);
+    TensorMatcher({E})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(expert_psum);
+
+    const auto hidden_dim = N.unwrap();
+    RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
+    RuntimeCheck(hidden_dim % kGroupSize == 0);
+    RuntimeCheck(E.unwrap() > 0 && E.unwrap() <= kMaxExperts,
+                 "num_experts must be in [1, 256]");
+    RuntimeCheck(expert_alignment > 0,
+                 "expert_alignment must be positive");
+    const auto num_groups = static_cast<uint32_t>(hidden_dim / kGroupSize);
+
+    uint32_t scale_row_stride_int32 = 0;
+    if (!transposed) {
+      G.set_value(num_groups);
+      TensorMatcher({M, G})
+          .with_dtype<fp32_t>()
+          .with_device(device)
+          .verify(output_scale);
+    } else {
+      RuntimeCheck(kScaleUE8M0,
+                   "transposed layout only supports scale_ue8m0=true");
+      RuntimeCheck(num_groups % 4 == 0,
+                   "transposed layout requires num_groups % 4 == 0");
+      auto G_ = SymbolicSize{"G // 4"};
+      G_.set_value(num_groups / 4);
+      auto M_pad = SymbolicSize{"M padded"};
+      TensorMatcher({M, G_})
+          .with_strides({int64_t{1}, M_pad})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(output_scale);
+      scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap());
+    }
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    const auto num_experts = static_cast<uint32_t>(E.unwrap());
+    const auto params = SiluMulQuantPsumParams{
+        .input = static_cast<const bf16_t*>(input.data_ptr()),
+        .output = static_cast<fp8_e4m3_t*>(output.data_ptr()),
+        .output_scale = static_cast<float*>(output_scale.data_ptr()),
+        .expert_psum = static_cast<const int32_t*>(expert_psum.data_ptr()),
+        .swiglu_limit = static_cast<float>(swiglu_limit),
+        .hidden_dim = hidden_dim,
+        .num_tokens = num_tokens,
+        .num_experts = num_experts,
+        .expert_alignment = expert_alignment,
+        .scale_row_stride_int32 = scale_row_stride_int32,
+    };
+
+    const auto num_threads = static_cast<uint32_t>(hidden_dim / 8);
+    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads >= num_experts,
+                 "hidden_dim does not provide one thread per expert");
+    RuntimeCheck(num_threads <= 1024,
+                 "hidden_dim requires more than 1024 threads");
+    const auto kernel = transposed ? kernel_transposed : kernel_normal;
+    int sm_count = 0;
+    cudaDeviceGetAttribute(
+        &sm_count, cudaDevAttrMultiProcessorCount, device.unwrap().device_id);
+    RuntimeCheck(sm_count > 0, "failed to query multiProcessorCount");
+    // Two CTAs per SM matches the launch-bounds occupancy contract and keeps
+    // the persistent grid bounded independently of the expanded capacity.
+    const uint32_t resident_blocks = static_cast<uint32_t>(sm_count) * 2u;
+    const uint32_t grid_blocks = std::min(num_tokens, resident_blocks);
+    RuntimeCheck(grid_blocks > 0, "psum activation requires a non-empty buffer");
+    LaunchKernel(grid_blocks, num_threads, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
