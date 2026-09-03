@@ -35,6 +35,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
     DeepEPStreamingLayerResult,
+    _lane_layout_from_psum,
     is_deepep_streaming_enabled,
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
@@ -835,7 +836,17 @@ class FusedMoE(torch.nn.Module):
         device = hidden_states.device
         input_tokens = hidden_states.size(0)
         runner_backend = get_moe_runner_backend().value
-        runner_rows = list(dispatch_output.num_recv_tokens_per_expert)
+        runner_layout = dispatch_output.num_recv_tokens_per_expert
+        runner_psum = (
+            runner_layout.detach()
+            if isinstance(runner_layout, torch.Tensor)
+            else None
+        )
+        runner_rows = (
+            []
+            if runner_psum is not None
+            else [int(value) for value in runner_layout]
+        )
         topk_ids = (
             topk_output.topk_ids.detach()
             if TopKOutputChecker.format_is_standard(topk_output)
@@ -872,6 +883,7 @@ class FusedMoE(torch.nn.Module):
                 anchor_bracket_end_ns = anchor_selection["bracket_end_ns"]
 
                 topk_ids_host = None
+                runner_psum_host = None
                 metadata_d2h_bytes = 0
                 if topk_ids is not None:
                     topk_ids_host = torch.empty(
@@ -883,11 +895,26 @@ class FusedMoE(torch.nn.Module):
                     metadata_done = torch.cuda.Event()
                     with torch.cuda.stream(profile_stream):
                         topk_ids_host.copy_(topk_ids, non_blocking=True)
+                        if runner_psum is not None:
+                            runner_psum_host = torch.empty(
+                                runner_psum.shape,
+                                dtype=runner_psum.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            runner_psum_host.copy_(
+                                runner_psum, non_blocking=True
+                            )
                         metadata_done.record(profile_stream)
                     metadata_done.synchronize()
                     metadata_d2h_bytes = (
                         topk_ids_host.numel() * topk_ids_host.element_size()
                     )
+                    if runner_psum_host is not None:
+                        metadata_d2h_bytes += (
+                            runner_psum_host.numel()
+                            * runner_psum_host.element_size()
+                        )
 
             anchor_midpoint_ns = (anchor_bracket_start_ns + anchor_bracket_end_ns) // 2
 
@@ -926,6 +953,11 @@ class FusedMoE(torch.nn.Module):
             combine_done = events["combine_done"]
             dispatch_ms = origin.elapsed_time(dispatch_done)
             logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
+            profile_runner_rows = runner_rows
+            if runner_psum_host is not None:
+                profile_runner_rows = _lane_layout_from_psum(
+                    runner_psum_host.to(dtype=torch.int64).tolist()
+                )["expert_rows"]
 
             required_detail = {
                 "dispatch_prepare_done",
@@ -1089,8 +1121,8 @@ class FusedMoE(torch.nn.Module):
                         "received_buffer_rows": dispatch_buffer_rows,
                     },
                     "compute": {
-                        "runner_rows": sum(runner_rows),
-                        "nonempty_experts": sum(row > 0 for row in runner_rows),
+                        "runner_rows": sum(profile_runner_rows),
+                        "nonempty_experts": sum(row > 0 for row in profile_runner_rows),
                         "deep_gemm": deep_gemm_profile,
                     },
                 },
@@ -1120,9 +1152,9 @@ class FusedMoE(torch.nn.Module):
                             "combine_done_ms": origin.elapsed_time(combine_done),
                         },
                         "counters": {
-                            "runner_rows": sum(runner_rows),
+                            "runner_rows": sum(profile_runner_rows),
                             "nonempty_experts": sum(
-                                row > 0 for row in runner_rows
+                                row > 0 for row in profile_runner_rows
                             ),
                         },
                     }
@@ -1195,10 +1227,12 @@ class FusedMoE(torch.nn.Module):
                     "logical_outbound_gbps": logical_bytes / (dispatch_ms * 1e6),
                     "destinations": outbound,
                     "received_buffer_rows_before_runner": dispatch_buffer_rows,
-                    "runner_rows": sum(runner_rows),
-                    "runner_nonempty_experts": sum(row > 0 for row in runner_rows),
-                    "runner_max_expert_rows": max(runner_rows, default=0),
-                    "runner_rows_per_expert": runner_rows,
+                    "runner_rows": sum(profile_runner_rows),
+                    "runner_nonempty_experts": sum(
+                        row > 0 for row in profile_runner_rows
+                    ),
+                    "runner_max_expert_rows": max(profile_runner_rows, default=0),
+                    "runner_rows_per_expert": profile_runner_rows,
                 },
                 "grouped_mlp": {
                     "start_ms": origin.elapsed_time(dispatch_done),
