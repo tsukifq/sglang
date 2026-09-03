@@ -48,6 +48,7 @@ from sglang.srt.layers.moe.profiling import (
     build_moe_component_profile,
     best_cuda_clock_anchor,
     calibrated_event_timing_guard_ns,
+    cuda_clock_anchor_attempts,
     cuda_event_host_interval,
     ensure_moe_timeline_collector,
     host_clock_domain_id,
@@ -410,6 +411,8 @@ class FusedMoE(torch.nn.Module):
         self._deepep_timeline_enable_file = ""
         self._deepep_timeline_run_id = ""
         self._deepep_timeline_event_guard_ns = 0
+        self._deepep_timeline_calibration_id = ""
+        self._deepep_timeline_max_event_to_anchor_ns = 0
         self._deepep_timeline_clock_domain = ""
         self._deepep_timeline_layer_weight = 1
         self._deepep_timeline_selected_layer = False
@@ -472,6 +475,31 @@ class FusedMoE(torch.nn.Module):
                 raise ValueError(
                     "SGLANG_DEEPEP_TIMELINE_RUN_ID is required for arrival profiling"
                 )
+            if self._deepep_timeline_detail == "arrival":
+                self._deepep_timeline_calibration_id = os.getenv(
+                    "SGLANG_DEEPEP_TIMELINE_CALIBRATION_ID", ""
+                ).strip()
+                if not self._deepep_timeline_calibration_id:
+                    raise ValueError(
+                        "SGLANG_DEEPEP_TIMELINE_CALIBRATION_ID is required "
+                        "for arrival profiling"
+                    )
+                try:
+                    self._deepep_timeline_max_event_to_anchor_ns = int(
+                        os.environ[
+                            "SGLANG_DEEPEP_TIMELINE_MAX_EVENT_TO_ANCHOR_NS"
+                        ]
+                    )
+                except (KeyError, ValueError) as error:
+                    raise ValueError(
+                        "SGLANG_DEEPEP_TIMELINE_MAX_EVENT_TO_ANCHOR_NS must "
+                        "be set from the matched clock calibration"
+                    ) from error
+                if self._deepep_timeline_max_event_to_anchor_ns <= 0:
+                    raise ValueError(
+                        "SGLANG_DEEPEP_TIMELINE_MAX_EVENT_TO_ANCHOR_NS must "
+                        "be positive"
+                    )
             self._deepep_timeline_clock_domain = host_clock_domain_id()
             self._deepep_timeline_selected_layer = (
                 get_moe_a2a_backend().is_deepep() and self.layer_id in target_layers
@@ -624,15 +652,38 @@ class FusedMoE(torch.nn.Module):
                 return None
         elif call_index != self._deepep_timeline_target_call:
             return None
+
+        def enabled(name: str) -> bool:
+            return os.getenv(name, "0").lower() not in (
+                "",
+                "0",
+                "false",
+                "no",
+                "n",
+            )
+
+        if mode == "streaming":
+            execution_variant = (
+                "streaming-v2-arrival-gated"
+                if enabled("SGLANG_DEEPEP_V2_SYNC_BASELINE")
+                else "streaming-v2-async"
+            )
+        elif enabled("SGLANG_DEEPEP_RANK_READY"):
+            execution_variant = "staged-rank-ready"
+        elif enabled("SGLANG_DEEPEP_V2_BASELINE"):
+            execution_variant = "staged-v2-arrival-gated"
+        else:
+            execution_variant = "staged-public"
         return {
             "rank": self.moe_ep_rank,
             "layer_id": self.layer_id,
             "call_index": call_index,
             "mode": mode,
+            "execution_variant": execution_variant,
             "profile_detail": self._deepep_timeline_detail,
             "run_id": self._deepep_timeline_run_id or None,
             "sample_id": (
-                f"{self._deepep_timeline_run_id}:{mode}:"
+                f"{self._deepep_timeline_run_id}:{execution_variant}:"
                 f"layer={self.layer_id}:call={call_index}"
             ),
             "host_clock_domain_id": self._deepep_timeline_clock_domain,
@@ -643,6 +694,11 @@ class FusedMoE(torch.nn.Module):
             },
             "clock_contract": {
                 "event_timing_guard_ns": self._deepep_timeline_event_guard_ns,
+                "calibration_id": self._deepep_timeline_calibration_id,
+                "max_event_to_anchor_ns": (
+                    self._deepep_timeline_max_event_to_anchor_ns
+                ),
+                "anchor_attempts": cuda_clock_anchor_attempts(),
             },
         }
 
@@ -707,7 +763,9 @@ class FusedMoE(torch.nn.Module):
                 "layer_output_ready": arrival_timestamps["output_ready"],
             }
             component_provenance = {
-                "layer_entry": "sglang_caller_stream",
+                "layer_entry": (
+                    "sglang_caller_stream_event_recorded_at_moe_python_entry"
+                ),
                 "layer_output_ready": "sglang_caller_stream",
             }
             if "dispatch_input_ready" in recorded:
@@ -724,6 +782,7 @@ class FusedMoE(torch.nn.Module):
                 event_provenance=component_provenance,
                 counters={"input_tokens": input_tokens},
                 capabilities={
+                    "layer_entry_includes_host_launch_arrival": True,
                     "exact_dispatch_input_ready": (
                         "dispatch_input_ready" in recorded
                     ),
@@ -1087,7 +1146,9 @@ class FusedMoE(torch.nn.Module):
                 "layer_output_ready": arrival_timestamps["output_ready"],
             }
             component_provenance = {
-                "layer_entry": "sglang_caller_stream",
+                "layer_entry": (
+                    "sglang_caller_stream_event_recorded_at_moe_python_entry"
+                ),
                 "dispatch_first_output_ready": (
                     "consumer_stream_after_deepep_completion_wait"
                 ),
@@ -1160,6 +1221,7 @@ class FusedMoE(torch.nn.Module):
                     }
                 ],
                 capabilities={
+                    "layer_entry_includes_host_launch_arrival": True,
                     "exact_dispatch_input_ready": (
                         "dispatch_input_ready" in recorded
                     ),

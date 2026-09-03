@@ -62,13 +62,17 @@ def _normalize_profile_event(name: str, point: Any) -> dict[str, Any]:
 
 
 def _profile_interval_ms(
-    events: Mapping[str, Mapping[str, Any]], start: str, end: str
+    events: Mapping[str, Mapping[str, Any]],
+    start: str,
+    end: str,
+    *,
+    allow_negative: bool = False,
 ) -> Optional[float]:
     if start not in events or end not in events:
         return None
     start_ms = float(events[start]["rank_local_ms"])
     end_ms = float(events[end]["rank_local_ms"])
-    if end_ms < start_ms:
+    if end_ms < start_ms and not allow_negative:
         raise ValueError(f"profile event {end!r} precedes {start!r}")
     return end_ms - start_ms
 
@@ -153,6 +157,8 @@ def build_moe_component_profile(
     ):
         metrics["dispatch"] = {
             "layer_entry_to_input_ready_ms": dispatch_input_ready_ms,
+            "layer_entry_to_first_output_ms": dispatch_first_ms,
+            "layer_entry_to_all_output_ms": dispatch_all_ms,
             "input_to_first_output_ms": dispatch_first_ms,
             "input_to_all_output_ms": dispatch_all_ms,
             "output_readiness_spread_ms": dispatch_spread_ms,
@@ -174,10 +180,16 @@ def build_moe_component_profile(
             )
 
     consumer_first_ms = _profile_interval_ms(
-        normalized_events, "layer_entry", "dispatch_first_consumer_start"
+        normalized_events,
+        "layer_entry",
+        "dispatch_first_consumer_start",
+        allow_negative=execution_model == "streaming",
     )
     consumer_all_ms = _profile_interval_ms(
-        normalized_events, "layer_entry", "dispatch_all_consumer_start"
+        normalized_events,
+        "layer_entry",
+        "dispatch_all_consumer_start",
+        allow_negative=execution_model == "streaming",
     )
     consumer_spread_ms = _profile_interval_ms(
         normalized_events,
@@ -191,6 +203,8 @@ def build_moe_component_profile(
         dispatch_metrics = metrics.setdefault("dispatch", {})
         dispatch_metrics.update(
             {
+                "layer_entry_to_first_consumer_start_ms": consumer_first_ms,
+                "layer_entry_to_all_consumers_started_ms": consumer_all_ms,
                 "input_to_first_consumer_start_ms": consumer_first_ms,
                 "input_to_all_consumers_started_ms": consumer_all_ms,
                 "consumer_start_spread_ms": consumer_spread_ms,
@@ -203,11 +217,13 @@ def build_moe_component_profile(
                         normalized_events,
                         "dispatch_input_ready",
                         "dispatch_first_consumer_start",
+                        allow_negative=execution_model == "streaming",
                     ),
                     "ready_to_all_consumers_started_ms": _profile_interval_ms(
                         normalized_events,
                         "dispatch_input_ready",
                         "dispatch_all_consumer_start",
+                        allow_negative=execution_model == "streaming",
                     ),
                 }
             )
@@ -329,7 +345,7 @@ def calibrated_event_timing_guard_ns() -> int:
 def cuda_clock_anchor_attempts() -> int:
     """Return the bounded number of host/CUDA clock-anchor attempts."""
 
-    raw_value = os.getenv(_CLOCK_ANCHOR_ATTEMPTS_ENV, "8").strip()
+    raw_value = os.getenv(_CLOCK_ANCHOR_ATTEMPTS_ENV, "16").strip()
     try:
         attempts = int(raw_value)
     except ValueError as error:
@@ -456,15 +472,17 @@ def ensure_moe_timeline_collector() -> None:
         _COLLECTOR_QUEUE = work_queue
 
 
-def submit_moe_timeline_collection(collect: Callable[[], None]) -> None:
-    """Queue collection without synchronizing the serving thread."""
+def submit_moe_timeline_collection(collect: Callable[[], None]) -> bool:
+    """Queue collection without synchronizing or failing the serving thread."""
 
     ensure_moe_timeline_collector()
     assert _COLLECTOR_QUEUE is not None
     try:
         _COLLECTOR_QUEUE.put_nowait(collect)
-    except queue.Full as error:
-        raise RuntimeError("MoE timeline collector queue is full") from error
+    except queue.Full:
+        print("DEEPEP_TIMELINE_COLLECTOR_DROP reason=queue_full", flush=True)
+        return False
+    return True
 
 
 @contextmanager

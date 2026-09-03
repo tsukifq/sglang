@@ -11,7 +11,9 @@ from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
+    _launch_streaming_moe_waves,
     _require_per_lane_release,
+    _resolve_streaming_wave_size,
     configure_deepep_streaming_environment,
     is_deepep_v2_sync_baseline_enabled,
     launch_bf16_streaming_moe,
@@ -61,6 +63,34 @@ def test_streaming_environment_enables_required_protocol(monkeypatch):
     assert os.environ["EP_EXPERIMENTAL_STREAMING_LAYER"] == "1"
     assert os.environ["EP_REUSE_NCCL_COMM"] == "0"
     assert os.environ["NCCL_CUMEM_ENABLE"] == "1"
+
+
+def test_streaming_wave_size_tracks_loaded_deep_gemm_api(monkeypatch):
+    def current_api(*args, repeat_weight_groups=False, **kwargs):
+        return None
+
+    def stale_api(*args, **kwargs):
+        return None
+
+    monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE", raising=False)
+    assert (
+        _resolve_streaming_wave_size(
+            lanes=4, device_major=10, grouped_gemm=current_api
+        )
+        == 4
+    )
+    assert (
+        _resolve_streaming_wave_size(
+            lanes=4, device_major=10, grouped_gemm=stale_api
+        )
+        == 1
+    )
+
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE", "4")
+    with pytest.raises(RuntimeError, match="repeat_weight_groups"):
+        _resolve_streaming_wave_size(
+            lanes=4, device_major=10, grouped_gemm=stale_api
+        )
 
 
 def test_streaming_environment_rejects_disabled_nccl_cumem(monkeypatch):
@@ -129,6 +159,15 @@ def test_streaming_generation_owned_control_removes_deferred_psum_copy():
     source = inspect.getsource(_launch_streaming_moe_lanes)
 
     assert "expert_psum_snapshot" not in source
+
+
+def test_streaming_wave_profile_marks_shared_compute_events():
+    source = inspect.getsource(_launch_streaming_moe_waves)
+
+    assert '"compute_scope": "wave"' in source
+    assert '"compute_group_id": wave_index' in source
+    assert "streaming_combine_return(" in source
+    assert "release_streaming_lane(lane, dispatch.generation)" in source
 
 
 def test_streaming_view_finalize_is_after_reduce_and_lane_drain_waits():
@@ -321,7 +360,7 @@ def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
     assert signature.parameters["is_fp4_expert"].default is False
 
     source = inspect.getsource(launch_fp8_streaming_moe)
-    assert source.count("m_grouped_fp8_gemm_nt_contiguous") == 4
+    assert source.count("deep_gemm.m_grouped_fp8_gemm_nt_contiguous(") == 4
     assert source.count("use_psum_layout=True") == 4
     assert "fuse_silu_and_mul=True" in source
     assert "silu_and_mul_clamp(gate_up[lane], down_input[lane], swiglu_limit)" in source

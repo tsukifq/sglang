@@ -10,6 +10,7 @@ kernels.  The regular DeepEP path remains the default.
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import time
 from dataclasses import dataclass
@@ -79,6 +80,40 @@ def configure_deepep_streaming_environment() -> None:
                 f"got {current!r}"
             )
         os.environ[name] = required
+
+
+def _resolve_streaming_wave_size(
+    *, lanes: int, device_major: int, grouped_gemm: Callable[..., Any]
+) -> int:
+    """Choose a wave size supported by the loaded DeepGEMM extension."""
+
+    try:
+        supports_repeated_weights = (
+            "repeat_weight_groups" in inspect.signature(grouped_gemm).parameters
+        )
+    except (TypeError, ValueError):
+        supports_repeated_weights = False
+
+    configured = os.getenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE")
+    if configured is None:
+        return (
+            4
+            if device_major >= 10
+            and lanes % 4 == 0
+            and supports_repeated_weights
+            else 1
+        )
+
+    wave_size = int(configured)
+    if wave_size <= 0:
+        raise ValueError("SGLANG_DEEPEP_STREAMING_WAVE_SIZE must be positive")
+    if wave_size > 1 and not supports_repeated_weights:
+        raise RuntimeError(
+            "the loaded DeepGEMM extension does not support "
+            "repeat_weight_groups; rebuild DeepGEMM or set "
+            "SGLANG_DEEPEP_STREAMING_WAVE_SIZE=1"
+        )
+    return wave_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,7 +348,7 @@ def _emit_streaming_timeline(
     context: dict[str, Any],
     origin: torch.cuda.Event,
     dispatch_done: torch.cuda.Event,
-    lane_events: Sequence[dict[str, torch.cuda.Event]],
+    lane_events: Sequence[dict[str, Any]],
     reduce_start: torch.cuda.Event,
     reduce_done: torch.cuda.Event,
 ) -> None:
@@ -407,11 +442,16 @@ def _emit_streaming_timeline(
                     "layer_output_ready": output_ready,
                 },
                 event_provenance={
-                    "layer_entry": "sglang_caller_stream",
+                    "layer_entry": (
+                        "sglang_caller_stream_event_recorded_at_moe_python_entry"
+                    ),
                     "layer_output_ready": "source_reduce_stream",
                 },
                 counters={"input_tokens": input_tokens},
-                capabilities={"exact_dispatch_output_ready": False},
+                capabilities={
+                    "layer_entry_includes_host_launch_arrival": True,
+                    "exact_dispatch_output_ready": False,
+                },
             )
             collector_before_log_ns = time.monotonic_ns()
             serving_done_ns = defer_state["done_ns"]
@@ -499,6 +539,10 @@ def _emit_streaming_timeline(
             lanes.append(
                 {
                     "source_rank": source_rank,
+                    "compute_scope": events.get("compute_scope", "lane"),
+                    "compute_group_id": events.get(
+                        "compute_group_id", source_rank
+                    ),
                     **_lane_layout_from_psum(psum),
                     "gemm_start_ms": ready_ms,
                     "gemm_done_ms": gemm_done_ms,
@@ -560,6 +604,8 @@ def _emit_streaming_timeline(
                         "combine_done": arrival["return_done"],
                     },
                     "counters": {
+                        "compute_scope": lane["compute_scope"],
+                        "compute_group_id": lane["compute_group_id"],
                         "useful_rows": lane["useful_rows"],
                         "active_span_rows": lane["active_span_rows"],
                         "alignment_hole_rows": lane["alignment_hole_rows"],
@@ -589,7 +635,9 @@ def _emit_streaming_timeline(
             "layer_output_ready": combine_all_done,
         }
         component_provenance = {
-            "layer_entry": "sglang_caller_stream",
+            "layer_entry": (
+                "sglang_caller_stream_event_recorded_at_moe_python_entry"
+            ),
             "dispatch_transport_done": "deepep_transport_completion_event",
             "dispatch_first_consumer_start": (
                 "lane_stream_after_deepep_doorbell_wait_proxy"
@@ -631,8 +679,12 @@ def _emit_streaming_timeline(
             },
             items=component_items,
             capabilities={
+                "layer_entry_includes_host_launch_arrival": True,
                 "exact_dispatch_input_ready": dispatch_input_ready is not None,
                 "exact_dispatch_output_ready": False,
+                "exact_per_lane_compute": all(
+                    lane["compute_scope"] == "lane" for lane in lanes
+                ),
             },
         )
         collector_before_log_ns = time.monotonic_ns()
@@ -664,9 +716,20 @@ def _emit_streaming_timeline(
                     psum_host.numel() * psum_host.element_size()
                     + topk_host.numel() * topk_host.element_size()
                 ),
-                "timed_cuda_event_count": (
-                    4 * len(lane_events) + 3 + len(profile_events)
-                ),
+                "timed_cuda_event_count": len(
+                    {
+                        id(events[name])
+                        for events in lane_events
+                        for name in (
+                            "gemm_start",
+                            "gemm_done",
+                            "return_start",
+                            "return_done",
+                        )
+                    }
+                )
+                + 3
+                + len(profile_events),
             },
             "clock_alignment": {
                 "method": (
@@ -815,7 +878,7 @@ def _launch_streaming_moe_lanes(
     timeline_enabled = timeline_context is not None
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
-    lane_timeline: list[dict[str, torch.cuda.Event]] = []
+    lane_timeline: list[dict[str, Any]] = []
     dispatch_done = None
     if timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
@@ -940,6 +1003,8 @@ def _launch_streaming_moe_lanes(
                         "gemm_done": gemm_done,
                         "return_start": return_start,
                         "return_done": return_done,
+                        "compute_scope": "lane",
+                        "compute_group_id": lane,
                     }
                 )
 
@@ -1083,7 +1148,7 @@ def _launch_streaming_moe_waves(
     timeline_enabled = timeline_context is not None
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
-    lane_timeline: list[dict[str, torch.cuda.Event]] = [
+    lane_timeline: list[dict[str, Any]] = [
         {} for _ in range(lanes)
     ]
     dispatch_done = None
@@ -1094,9 +1159,9 @@ def _launch_streaming_moe_waves(
             dispatch.transport_event.current_stream_wait()
             dispatch_done.record(profile_stream)
 
-    # Each source lane keeps an independent transport stream.  Only the GEMMs
-    # are coalesced: serializing release and combine-return on the wave stream
-    # throws away NVLink concurrency and is substantially slower on B200.
+    # Each source lane keeps an independent transport stream.  GEMMs are
+    # coalesced by wave, while return and ingress ACK remain source-local so
+    # buffer reuse is not coupled to the slowest lane in a wave.
     wave_ready_events: list[torch.cuda.Event] = []
     for (start, stop), wave_stream in zip(wave_ranges, wave_streams):
         ingress_ready = []
@@ -1182,9 +1247,28 @@ def _launch_streaming_moe_waves(
             if tensor is not None:
                 tensor.record_stream(stream)
 
+        route_ready_events = []
         for lane in range(start, stop):
             lane_stream = streams[lane]
             lane_stream.wait_event(wave_compute_done)
+            with torch.cuda.stream(lane_stream):
+                dispatch.transport_event.current_stream_wait()
+                masked_route_weight_mul_(
+                    lane_output[lane],
+                    dispatch.route_weights[lane],
+                    dispatch.expert_psum[lane, -1:],
+                )
+                route_ready = torch.cuda.Event()
+                route_ready.record(lane_stream)
+                route_ready_events.append(route_ready)
+
+            for tensor in (*dispatch_tensors, *persistent_tensors, lane_output):
+                if tensor is not None:
+                    tensor.record_stream(lane_stream)
+
+        for lane, route_ready in zip(range(start, stop), route_ready_events):
+            lane_stream = streams[lane]
+            lane_stream.wait_event(route_ready)
             with torch.cuda.stream(lane_stream):
                 return_start = (
                     torch.cuda.Event(enable_timing=True)
@@ -1195,12 +1279,6 @@ def _launch_streaming_moe_waves(
                     torch.cuda.Event(enable_timing=True)
                     if timeline_enabled
                     else None
-                )
-                dispatch.transport_event.current_stream_wait()
-                masked_route_weight_mul_(
-                    lane_output[lane],
-                    dispatch.route_weights[lane],
-                    dispatch.expert_psum[lane, -1:],
                 )
                 if return_start is not None:
                     return_start.record(lane_stream)
@@ -1222,11 +1300,10 @@ def _launch_streaming_moe_waves(
                         "gemm_done": gemm_done,
                         "return_start": return_start,
                         "return_done": return_done,
+                        "compute_scope": "wave",
+                        "compute_group_id": wave_index,
                     }
-
-            for tensor in (*dispatch_tensors, *persistent_tensors, lane_output):
-                if tensor is not None:
-                    tensor.record_stream(lane_stream)
+            metadata.record_stream(lane_stream)
 
     if any(done is None for done in returned):
         raise RuntimeError("not every DeepEP streaming lane scheduled a return")
@@ -1318,7 +1395,7 @@ def launch_bf16_streaming_moe(
     lanes, lane_capacity, hidden = dispatch.x.shape
     local_experts, gate_up_width, w13_physical_k = w13_weight.shape
     w2_experts, output_width, w2_physical_k = w2_weight.shape
-    packing = 2 if is_fp4_expert else 1
+    packing = 1
     intermediate = w2_physical_k * packing
     if (
         w13_physical_k * packing != hidden
@@ -1640,16 +1717,10 @@ def launch_fp8_streaming_moe(
         )
         return transient_tensors
 
-    configured_wave_size = os.getenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE")
-    wave_size = (
-        int(configured_wave_size)
-        if configured_wave_size is not None
-        else (
-            4
-            if torch.cuda.get_device_capability(dispatch.x.device)[0] >= 10
-            and lanes % 4 == 0
-            else 1
-        )
+    wave_size = _resolve_streaming_wave_size(
+        lanes=lanes,
+        device_major=torch.cuda.get_device_capability(dispatch.x.device)[0],
+        grouped_gemm=deep_gemm.m_grouped_fp8_gemm_nt_contiguous,
     )
     if wave_size > 1:
         if lanes % wave_size != 0:
