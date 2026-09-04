@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.deepep_streaming import (
     _require_per_lane_release,
     _resolve_streaming_wave_size,
     configure_deepep_streaming_environment,
+    is_deepep_streaming_rank_merge_enabled,
     is_deepep_v2_sync_baseline_enabled,
     launch_bf16_streaming_moe,
     launch_fp8_streaming_moe,
@@ -29,6 +30,12 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_moe_wavefront_slot,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+
+register_cuda_ci(
+    est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b200"
 )
 
 
@@ -151,6 +158,13 @@ def test_v2_sync_baseline_gate_is_explicit(monkeypatch):
     barrier_event = source.index("all_lanes_ready.record(source_stream)")
     lane_compute = source.index("lane_compute(lane, lane_output[lane])")
     assert all_lane_wait < barrier_event < lane_compute
+
+
+def test_streaming_rank_merge_is_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", raising=False)
+    assert not is_deepep_streaming_rank_merge_enabled()
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", "1")
+    assert is_deepep_streaming_rank_merge_enabled()
 
 
 def test_streaming_dispatch_rejects_incomplete_runtime_view():
@@ -392,8 +406,8 @@ def test_fp8_streaming_consumes_psum_layout_without_shadow_pack():
     assert signature.parameters["is_fp4_expert"].default is False
 
     source = inspect.getsource(launch_fp8_streaming_moe)
-    assert source.count("deep_gemm.m_grouped_fp8_gemm_nt_contiguous(") == 4
-    assert source.count("use_psum_layout=True") == 4
+    assert source.count("deep_gemm.m_grouped_fp8_gemm_nt_contiguous(") == 6
+    assert source.count("use_psum_layout=True") == 6
     assert "fuse_silu_and_mul=True" in source
     assert "silu_and_mul_clamp(gate_up[lane], down_input[lane], swiglu_limit)" in source
     assert "fuse_silu_and_mul=False" in source

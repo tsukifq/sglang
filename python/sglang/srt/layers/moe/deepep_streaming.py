@@ -19,7 +19,10 @@ from typing import Any, Callable, Sequence
 import torch
 
 from sglang.srt.layers.moe.deepep_streaming_kernels import (
+    build_rank_merged_expert_layout,
     masked_route_weight_mul_,
+    pack_rank_merged_rows,
+    scatter_rank_merged_rows,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.profiling import (
@@ -56,6 +59,20 @@ def is_deepep_v2_sync_baseline_enabled() -> bool:
     """Gate all V2 source lanes on the slowest arrival for fair baselines."""
 
     return os.getenv("SGLANG_DEEPEP_V2_SYNC_BASELINE", "0").lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "n",
+    )
+
+
+def is_deepep_streaming_rank_merge_enabled() -> bool:
+    """Coalesce equal experts across ready source lanes on the owner rank."""
+
+    return os.getenv(
+        "SGLANG_DEEPEP_STREAMING_RANK_MERGE", "0"
+    ).lower() not in (
         "",
         "0",
         "false",
@@ -1090,6 +1107,7 @@ def _launch_streaming_moe_waves(
     persistent_tensors: Sequence[torch.Tensor],
     *,
     wave_size: int,
+    route_weights_applied: bool = False,
     streams: Sequence[torch.cuda.Stream],
     drain_stream: torch.cuda.Stream,
     timeline_context: dict[str, Any] | None,
@@ -1238,7 +1256,6 @@ def _launch_streaming_moe_waves(
     for wave_index in wave_order:
         start, stop = wave_ranges[wave_index]
         stream = wave_streams[wave_index]
-        stream.wait_event(wave_ready_events[wave_index])
         with torch.cuda.stream(stream):
             gemm_start = (
                 torch.cuda.Event(enable_timing=True) if timeline_enabled else None
@@ -1258,28 +1275,24 @@ def _launch_streaming_moe_waves(
             if tensor is not None:
                 tensor.record_stream(stream)
 
-        route_ready_events = []
         for lane in range(start, stop):
             lane_stream = streams[lane]
             lane_stream.wait_event(wave_compute_done)
             with torch.cuda.stream(lane_stream):
                 dispatch.transport_event.current_stream_wait()
-                masked_route_weight_mul_(
-                    lane_output[lane],
-                    dispatch.route_weights[lane],
-                    dispatch.expert_psum[lane, -1:],
-                )
-                route_ready = torch.cuda.Event()
-                route_ready.record(lane_stream)
-                route_ready_events.append(route_ready)
+                if not route_weights_applied:
+                    masked_route_weight_mul_(
+                        lane_output[lane],
+                        dispatch.route_weights[lane],
+                        dispatch.expert_psum[lane, -1:],
+                    )
 
             for tensor in (*dispatch_tensors, *persistent_tensors, lane_output):
                 if tensor is not None:
                     tensor.record_stream(lane_stream)
 
-        for lane, route_ready in zip(range(start, stop), route_ready_events):
+        for lane in range(start, stop):
             lane_stream = streams[lane]
-            lane_stream.wait_event(route_ready)
             with torch.cuda.stream(lane_stream):
                 return_start = (
                     torch.cuda.Event(enable_timing=True)
@@ -1493,6 +1506,7 @@ def launch_fp8_streaming_moe(
     from sglang.jit_kernel.dsv4.moe import (
         silu_and_mul_clamp,
         silu_and_mul_masked_post_quant,
+        silu_and_mul_psum_post_quant,
     )
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
@@ -1615,11 +1629,21 @@ def launch_fp8_streaming_moe(
     down_input = None
     down_input_scale = None
     packed_lane_quant = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    rank_merge_enabled = is_deepep_streaming_rank_merge_enabled()
+    if rank_merge_enabled and not (
+        is_fp4_expert
+        and packed_lane_quant
+        and dispatch.sf.dtype == torch.int32
+    ):
+        raise RuntimeError(
+            "rank-merged streaming currently requires FP8 activations with "
+            "packed UE8M0 scales and MXFP4 expert weights"
+        )
     use_masked_activation = packed_lane_quant
     lane_down_input_buffer = None
     lane_down_scale_storage = None
     if use_masked_activation:
-        if activation_stream is None:
+        if not rank_merge_enabled and activation_stream is None:
             activation_stream = torch.cuda.Stream(priority=0)
         lane_scale_groups = intermediate // block_k
         if lane_scale_groups % 4 != 0:
@@ -1637,6 +1661,30 @@ def launch_fp8_streaming_moe(
     elif swiglu_limit is not None:
         down_input = torch.empty(
             (lanes, lane_capacity, intermediate),
+            dtype=torch.bfloat16,
+            device=dispatch.x.device,
+        )
+
+    # Allocate the large rank-merge scratch while DeepEP transport is already
+    # running. Allocating it inside wave_compute would put allocator latency
+    # after the all-lane readiness join and directly on the critical path.
+    rank_merged_x_buffer = None
+    rank_merged_input_scale_storage = None
+    rank_merged_output_buffer = None
+    if rank_merge_enabled:
+        total_lane_rows = lanes * lane_capacity
+        rank_merged_x_buffer = torch.empty(
+            (total_lane_rows, hidden),
+            dtype=dispatch.x.dtype,
+            device=dispatch.x.device,
+        )
+        rank_merged_input_scale_storage = torch.empty(
+            (dispatch.sf.size(2), total_lane_rows),
+            dtype=dispatch.sf.dtype,
+            device=dispatch.x.device,
+        )
+        rank_merged_output_buffer = torch.empty(
+            (total_lane_rows, hidden),
             dtype=torch.bfloat16,
             device=dispatch.x.device,
         )
@@ -1733,6 +1781,11 @@ def launch_fp8_streaming_moe(
         device_major=torch.cuda.get_device_capability(dispatch.x.device)[0],
         grouped_gemm=deep_gemm.m_grouped_fp8_gemm_nt_contiguous,
     )
+    if rank_merge_enabled and wave_size <= 1:
+        raise RuntimeError(
+            "rank-merged streaming requires "
+            "SGLANG_DEEPEP_STREAMING_WAVE_SIZE greater than one"
+        )
     if wave_size > 1:
         if lanes % wave_size != 0:
             raise ValueError(f"wave_size={wave_size} must divide {lanes} lanes")
@@ -1742,13 +1795,105 @@ def launch_fp8_streaming_moe(
             drain_stream = torch.cuda.Stream(priority=0)
 
         wave_gemm_kwargs = dict(gemm_kwargs)
-        wave_gemm_kwargs["repeat_weight_groups"] = True
+        if not rank_merge_enabled:
+            wave_gemm_kwargs["repeat_weight_groups"] = True
 
         def wave_compute(
             start: int, stop: int, wave_output: torch.Tensor
         ) -> tuple[torch.Tensor, ...]:
             wave_lanes = stop - start
             wave_rows = wave_lanes * lane_capacity
+            if rank_merge_enabled:
+                assert dispatch.sf is not None
+                assert dispatch.route_weights is not None
+                assert lane_down_input_buffer is not None
+                assert lane_down_scale_storage is not None
+                layout = build_rank_merged_expert_layout(
+                    dispatch.expert_psum[start:stop].contiguous(),
+                    lane_capacity,
+                    alignment=128,
+                )
+                assert rank_merged_x_buffer is not None
+                assert rank_merged_input_scale_storage is not None
+                assert rank_merged_output_buffer is not None
+                merged_row_start = start * lane_capacity
+                merged_x = rank_merged_x_buffer.narrow(
+                    0, merged_row_start, wave_rows
+                )
+                merged_input_scale_storage = (
+                    rank_merged_input_scale_storage.narrow(
+                        1, merged_row_start, wave_rows
+                    )
+                )
+                merged_input_scale = merged_input_scale_storage.t()
+                pack_rank_merged_rows(
+                    dispatch.x[start:stop], merged_x, layout
+                )
+                pack_rank_merged_rows(
+                    dispatch.sf[start:stop], merged_input_scale, layout
+                )
+
+                merged_gate_up = gate_up[start:stop].reshape(
+                    wave_rows, gate_up_width
+                )
+                deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                    (merged_x, merged_input_scale),
+                    (w13_weight, w13_scale),
+                    merged_gate_up,
+                    layout.expert_psum,
+                    use_psum_layout=True,
+                    expected_m_for_psum_layout=expected_m_per_expert,
+                    **wave_gemm_kwargs,
+                )
+                scale_groups = intermediate // block_k
+                merged_down_input = lane_down_input_buffer[
+                    start:stop
+                ].reshape(wave_rows, intermediate)
+                merged_down_scale_storage = lane_down_scale_storage[
+                    start:stop
+                ].reshape(scale_groups // 4, wave_rows)
+                merged_down_scale = merged_down_scale_storage.t()
+                dispatch.transport_event.current_stream_wait()
+                silu_and_mul_psum_post_quant(
+                    merged_gate_up,
+                    merged_down_input,
+                    merged_down_scale,
+                    block_k,
+                    layout.expert_psum,
+                    expert_alignment=128,
+                    scale_ue8m0=True,
+                    transposed=True,
+                    swiglu_limit=swiglu_limit,
+                    use_pdl=False,
+                )
+                merged_result = rank_merged_output_buffer.narrow(
+                    0, merged_row_start, wave_rows
+                )
+                deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                    (merged_down_input, merged_down_scale),
+                    (w2_weight, w2_scale),
+                    merged_result,
+                    layout.expert_psum,
+                    use_psum_layout=True,
+                    expected_m_for_psum_layout=expected_m_per_expert,
+                    **wave_gemm_kwargs,
+                )
+                scatter_rank_merged_rows(
+                    merged_result,
+                    wave_output,
+                    layout,
+                    route_weights=dispatch.route_weights[start:stop],
+                )
+                return (
+                    merged_x,
+                    merged_input_scale_storage,
+                    merged_result,
+                    layout.source_starts,
+                    layout.counts,
+                    layout.destination_starts,
+                    layout.expert_psum,
+                )
+
             wave_x = dispatch.x[start:stop].reshape(wave_rows, hidden)
             # DeepEP stores each lane's packed UE8M0 scales column-major. One
             # transpose-copy produces the column-major scale matrix for the
@@ -1865,12 +2010,16 @@ def launch_fp8_streaming_moe(
                 down_input_scale,
                 lane_down_input_buffer,
                 lane_down_scale_storage,
+                rank_merged_x_buffer,
+                rank_merged_input_scale_storage,
+                rank_merged_output_buffer,
                 w13_weight,
                 w2_weight,
                 w13_scale,
                 w2_scale,
             ),
             wave_size=wave_size,
+            route_weights_applied=rank_merge_enabled,
             streams=streams,
             drain_stream=drain_stream,
             timeline_context=timeline_context,
