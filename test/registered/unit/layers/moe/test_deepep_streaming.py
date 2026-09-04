@@ -93,6 +93,38 @@ def test_streaming_wave_size_tracks_loaded_deep_gemm_api(monkeypatch):
         )
 
 
+def test_streaming_wave_size_reads_pybind_doc_when_signature_is_missing(
+    monkeypatch,
+):
+    def pybind_api(*args, **kwargs):
+        return None
+
+    pybind_api.__doc__ = (
+        "m_grouped(..., repeat_weight_groups: bool = False) -> None"
+    )
+    real_signature = inspect.signature
+
+    def signature(value):
+        if value is pybind_api:
+            raise ValueError("no signature found for builtin")
+        return real_signature(value)
+
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.deepep_streaming.inspect.signature",
+        signature,
+    )
+    monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE", raising=False)
+
+    assert (
+        _resolve_streaming_wave_size(
+            lanes=4,
+            device_major=10,
+            grouped_gemm=pybind_api,
+        )
+        == 4
+    )
+
+
 def test_streaming_environment_rejects_disabled_nccl_cumem(monkeypatch):
     monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
     with pytest.raises(RuntimeError, match="NCCL_CUMEM_ENABLE=1"):

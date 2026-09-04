@@ -92,7 +92,18 @@ def _resolve_streaming_wave_size(
             "repeat_weight_groups" in inspect.signature(grouped_gemm).parameters
         )
     except (TypeError, ValueError):
-        supports_repeated_weights = False
+        # pybind11 callables commonly omit __text_signature__, so
+        # inspect.signature raises even though their generated docstring has
+        # the complete C++ binding declaration.
+        declarations = (
+            getattr(grouped_gemm, "__text_signature__", None),
+            getattr(grouped_gemm, "__doc__", None),
+        )
+        supports_repeated_weights = any(
+            declaration
+            and "repeat_weight_groups" in declaration.splitlines()[0]
+            for declaration in declarations
+        )
 
     configured = os.getenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE")
     if configured is None:
