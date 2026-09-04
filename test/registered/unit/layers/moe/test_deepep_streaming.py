@@ -9,6 +9,7 @@ from sglang.srt.batch_overlap.operations import _resolve_tbo_child_contexts
 from sglang.srt.layers.moe.deepep_streaming_kernels import masked_route_weight_mul_
 from sglang.srt.layers.moe.deepep_streaming import (
     DeepEPStreamingDispatch,
+    _iter_ready_cuda_events,
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
     _launch_streaming_moe_waves,
@@ -132,6 +133,60 @@ def test_streaming_wave_size_reads_pybind_doc_when_signature_is_missing(
     )
 
 
+def test_ready_event_polling_can_avoid_scheduler_yields(monkeypatch):
+    class Event:
+        def __init__(self, ready_after):
+            self.ready_after = ready_after
+            self.queries = 0
+
+        def query(self):
+            self.queries += 1
+            return self.queries > self.ready_after
+
+    sleeps = []
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.deepep_streaming.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    monkeypatch.setenv(
+        "SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER", "0"
+    )
+
+    assert list(_iter_ready_cuda_events([Event(3), Event(1)])) == [1, 0]
+    assert sleeps == []
+
+
+def test_ready_event_polling_rejects_invalid_backoff(monkeypatch):
+    monkeypatch.setenv(
+        "SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER", "-1"
+    )
+
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        list(_iter_ready_cuda_events([]))
+
+
+def test_ready_event_polling_preserves_default_yield(monkeypatch):
+    class Event:
+        def __init__(self):
+            self.queries = 0
+
+        def query(self):
+            self.queries += 1
+            return self.queries > 1
+
+    sleeps = []
+    monkeypatch.delenv(
+        "SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER", raising=False
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.deepep_streaming.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    assert list(_iter_ready_cuda_events([Event()])) == [0]
+    assert sleeps == [0]
+
+
 def test_streaming_environment_rejects_disabled_nccl_cumem(monkeypatch):
     monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
     with pytest.raises(RuntimeError, match="NCCL_CUMEM_ENABLE=1"):
@@ -185,7 +240,7 @@ def test_streaming_layer_gates_sm100_transport_before_lane_consumers():
     assert "streaming_combine_reduce" in source
     assert "release_streaming_lane(lane, dispatch.generation)" in source
     assert "host_lane_gate" in source
-    assert "lane_ready_events[lane].query()" in source
+    assert "_iter_ready_cuda_events(lane_ready_events)" in source
     assert ".synchronize(" not in source
     assert ".barrier(" not in source
 

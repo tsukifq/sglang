@@ -144,6 +144,49 @@ def _resolve_streaming_wave_size(
     return wave_size
 
 
+def _iter_ready_cuda_events(
+    events: Sequence[torch.cuda.Event],
+):
+    """Yield CUDA-event indices without yielding the host on every miss.
+
+    time.sleep(0) on every unsuccessful query adds scheduler wake-up latency
+    to each MoE layer. A configurable number of busy queries keeps the
+    latency-sensitive path responsive while retaining the old behavior at the
+    default value of one. Zero disables host yielding for controlled B200
+    experiments.
+    """
+
+    try:
+        yield_after = int(
+            os.getenv("SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER", "1")
+        )
+    except ValueError as error:
+        raise ValueError(
+            "SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER must be an integer"
+        ) from error
+    if yield_after < 0:
+        raise ValueError(
+            "SGLANG_DEEPEP_STREAMING_HOST_POLL_YIELD_AFTER must be nonnegative"
+        )
+
+    pending = set(range(len(events)))
+    idle_polls = 0
+    while pending:
+        made_progress = False
+        for index in tuple(pending):
+            if events[index].query():
+                pending.remove(index)
+                made_progress = True
+                yield index
+        if made_progress:
+            idle_polls = 0
+        elif yield_after:
+            idle_polls += 1
+            if idle_polls >= yield_after:
+                time.sleep(0)
+                idle_polls = 0
+
+
 @dataclass(frozen=True, slots=True)
 class DeepEPStreamingDispatch:
     """One generation of lane-local dispatch state."""
@@ -945,19 +988,7 @@ def _launch_streaming_moe_lanes(
             lane_ready.record(stream)
             lane_ready_events.append(lane_ready)
 
-        def iter_ready_lanes():
-            pending = set(range(lanes))
-            while pending:
-                made_progress = False
-                for lane in tuple(pending):
-                    if lane_ready_events[lane].query():
-                        pending.remove(lane)
-                        made_progress = True
-                        yield lane
-                if not made_progress:
-                    time.sleep(0)
-
-        lane_order = iter_ready_lanes()
+        lane_order = _iter_ready_cuda_events(lane_ready_events)
 
     for lane in lane_order:
         stream = streams[lane]
@@ -1228,19 +1259,7 @@ def _launch_streaming_moe_waves(
             wave_ready_events.append(wave_ready)
 
     if all_lanes_ready is None:
-        def iter_ready_waves():
-            pending = set(range(len(wave_ranges)))
-            while pending:
-                made_progress = False
-                for wave_index in tuple(pending):
-                    if wave_ready_events[wave_index].query():
-                        pending.remove(wave_index)
-                        made_progress = True
-                        yield wave_index
-                if not made_progress:
-                    time.sleep(0)
-
-        wave_order = iter_ready_waves()
+        wave_order = _iter_ready_cuda_events(wave_ready_events)
     else:
         wave_order = range(len(wave_ranges))
 
