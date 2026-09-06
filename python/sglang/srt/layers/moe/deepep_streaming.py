@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.profiling import (
     cuda_event_host_interval,
     submit_moe_timeline_collection,
 )
+from sglang.srt.layers.moe.streaming_timeline import source_lane_records
 
 _DEEPEP_STREAMING_REQUIRED_ENV = {
     "EP_EXPERIMENTAL_STREAMING_LANES": "1",
@@ -602,7 +603,7 @@ def _emit_streaming_timeline(
         total_logical_bytes = sum(item["logical_payload_bytes"] for item in outbound)
         lanes = []
         lane_arrivals = []
-        for source_rank, (events, psum) in enumerate(zip(lane_events, psums)):
+        for source_rank, events, psum in source_lane_records(lane_events, psums):
             ready_ms = origin.elapsed_time(events["gemm_start"])
             gemm_done_ms = origin.elapsed_time(events["gemm_done"])
             return_start_ms = origin.elapsed_time(events["return_start"])
@@ -949,7 +950,9 @@ def _launch_streaming_moe_lanes(
     timeline_enabled = timeline_context is not None
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
-    lane_timeline: list[dict[str, Any]] = []
+    # Host readiness order is not source-rank order. Keep metadata indexed by
+    # the lane that owns the events, just like expert_psum and route_weights.
+    lane_timeline: list[dict[str, Any]] = [{} for _ in range(lanes)]
     dispatch_done = None
     if timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
@@ -1056,16 +1059,15 @@ def _launch_streaming_moe_lanes(
             lane_finalized.record(stream)
             returned.append(lane_finalized)
             if timeline_enabled:
-                lane_timeline.append(
-                    {
-                        "gemm_start": gemm_start,
-                        "gemm_done": gemm_done,
-                        "return_start": return_start,
-                        "return_done": return_done,
-                        "compute_scope": "lane",
-                        "compute_group_id": lane,
-                    }
-                )
+                lane_timeline[lane] = {
+                    "source_rank": lane,
+                    "gemm_start": gemm_start,
+                    "gemm_done": gemm_done,
+                    "return_start": return_start,
+                    "return_done": return_done,
+                    "compute_scope": "lane",
+                    "compute_group_id": lane,
+                }
 
         for tensor in (
             *dispatch_tensors,
@@ -1092,9 +1094,9 @@ def _launch_streaming_moe_lanes(
     )
     if reduce_done is not None:
         reduce_done.record(source_stream)
-    # Per-lane release calls publish the remote ACKs.  This drain protects only
-    # local view/tensor lifetime: strict per-lane DeepEP records its event for
-    # destroy, but deliberately does not make the next dispatch wait on it.
+    # Per-lane release calls publish remote ACKs. This drain joins local view
+    # readers and source reduce; strict per-lane DeepEP also fences the next
+    # dispatch reusing this ElasticBuffer slot on the accumulated drain event.
     # Reduce must be host-submitted before finalizing the outstanding view.
     with torch.cuda.stream(drain_stream):
         # The return buffer is shared by successive streaming generations.
@@ -1339,6 +1341,7 @@ def _launch_streaming_moe_waves(
                 returned[lane] = lane_finalized
                 if timeline_enabled:
                     lane_timeline[lane] = {
+                        "source_rank": lane,
                         "gemm_start": gemm_start,
                         "gemm_done": gemm_done,
                         "return_start": return_start,
