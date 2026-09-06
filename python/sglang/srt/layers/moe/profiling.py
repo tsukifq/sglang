@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import json
 import math
 import os
 import queue
@@ -24,8 +25,14 @@ _ACTIVE_MOE_TIMELINE: ContextVar[Optional[dict[str, Any]]] = ContextVar(
 )
 _COLLECTOR_LOCK = threading.Lock()
 _COLLECTOR_QUEUE: Optional[queue.Queue[Callable[[], None]]] = None
+_OUTPUT_LOCK = threading.Lock()
+_OUTPUT_STREAMS: dict[tuple[int, str], Any] = {}
+_RETAINED_COLLECTIONS: list[Callable[[], None]] = []
 _EVENT_GUARD_ENV = "SGLANG_DEEPEP_TIMELINE_EVENT_GUARD_NS"
 _CLOCK_ANCHOR_ATTEMPTS_ENV = "SGLANG_DEEPEP_TIMELINE_CLOCK_ANCHOR_ATTEMPTS"
+_OUTPUT_DIR_ENV = "SGLANG_DEEPEP_TIMELINE_OUTPUT_DIR"
+_RETAIN_COMPLETED_ENV = "SGLANG_DEEPEP_TIMELINE_RETAIN_COMPLETED"
+_EMIT_STATS_PREFIX = "DEEPEP_TIMELINE_EMIT_STATS"
 
 MOE_COMPONENT_PROFILE_SCHEMA = "async-moe-component-profile-v1"
 _EXECUTION_MODELS = frozenset(("staged", "streaming"))
@@ -435,7 +442,21 @@ def cuda_event_host_interval(
     }
 
 
+def moe_timeline_retain_completed_limit() -> int:
+    """Return how many completed collector closures remain live per process."""
+
+    raw_value = os.getenv(_RETAIN_COMPLETED_ENV, "16").strip()
+    try:
+        limit = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{_RETAIN_COMPLETED_ENV} must be an integer") from error
+    if not 0 <= limit <= 128:
+        raise ValueError(f"{_RETAIN_COMPLETED_ENV} must be between 0 and 128")
+    return limit
+
+
 def _collector_main(work_queue: queue.Queue[Callable[[], None]]) -> None:
+    retain_limit = moe_timeline_retain_completed_limit()
     while True:
         collect = work_queue.get()
         try:
@@ -445,6 +466,13 @@ def _collector_main(work_queue: queue.Queue[Callable[[], None]]) -> None:
             traceback.print_exc()
         finally:
             work_queue.task_done()
+            # Replacing ``collect`` at the next queue.get() destroys the prior
+            # closure on the collector thread. Some CUDA/PyTorch resource
+            # finalizers can then hold the GIL and stall every serving rank.
+            # Keep a small, explicitly bounded diagnostic cohort alive until
+            # process teardown so finalization never lands in the live window.
+            if len(_RETAINED_COLLECTIONS) < retain_limit:
+                _RETAINED_COLLECTIONS.append(collect)
 
 
 def ensure_moe_timeline_collector() -> None:
@@ -483,6 +511,76 @@ def submit_moe_timeline_collection(collect: Callable[[], None]) -> bool:
         print("DEEPEP_TIMELINE_COLLECTOR_DROP reason=queue_full", flush=True)
         return False
     return True
+
+
+def _write_moe_timeline_line(line: str, rank: int) -> tuple[str, int]:
+    """Write one record without routing large payloads through worker stdout."""
+
+    output_dir = os.getenv(_OUTPUT_DIR_ENV, "").strip()
+    if not output_dir:
+        print(line, flush=True)
+        return "stdout", len(line.encode("utf-8")) + 1
+    if type(rank) is not int or rank < 0:
+        raise ValueError("timeline file output requires a nonnegative integer rank")
+
+    resolved_dir = os.path.abspath(os.path.expanduser(output_dir))
+    os.makedirs(resolved_dir, exist_ok=True)
+    path = os.path.join(resolved_dir, f"rank-{rank}.jsonl")
+    key = (os.getpid(), path)
+    with _OUTPUT_LOCK:
+        stream = _OUTPUT_STREAMS.get(key)
+        if stream is None or stream.closed:
+            stream = open(path, "a", encoding="utf-8", buffering=1024 * 1024)
+            _OUTPUT_STREAMS[key] = stream
+        written = stream.write(line + "\n")
+        # Flush to the kernel page cache so analysis can start before server
+        # shutdown. This deliberately avoids fsync and worker stdout IPC.
+        stream.flush()
+    return path, written
+
+
+def emit_moe_timeline_record(
+    prefix: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Serialize and emit one timeline plus a compact, timed marker.
+
+    Setting ``SGLANG_DEEPEP_TIMELINE_OUTPUT_DIR`` writes one JSONL file per
+    rank instead of routing large records through worker stdout. The default
+    remains stdout for compatibility.
+    """
+
+    normalized_prefix = prefix.strip()
+    if not normalized_prefix or any(char.isspace() for char in normalized_prefix):
+        raise ValueError("timeline prefix must be one nonempty token")
+    rank = payload.get("rank")
+    if type(rank) is not int or rank < 0:
+        raise ValueError("timeline payload requires a nonnegative integer rank")
+
+    serialize_started_ns = time.monotonic_ns()
+    record = normalized_prefix + " " + json.dumps(
+        payload, separators=(",", ":"), allow_nan=False
+    )
+    serialize_done_ns = time.monotonic_ns()
+    write_started_ns = serialize_done_ns
+    destination, record_bytes = _write_moe_timeline_line(record, rank)
+    write_done_ns = time.monotonic_ns()
+    stats = {
+        "schema": "async-moe-timeline-emit-stats-v1",
+        "rank": rank,
+        "layer_id": payload.get("layer_id"),
+        "call_index": payload.get("call_index"),
+        "sample_id": payload.get("sample_id"),
+        "destination": destination,
+        "record_bytes": record_bytes,
+        "serialize_us": (serialize_done_ns - serialize_started_ns) / 1e3,
+        "write_us": (write_done_ns - write_started_ns) / 1e3,
+        "emit_total_us": (write_done_ns - serialize_started_ns) / 1e3,
+    }
+    stats_record = _EMIT_STATS_PREFIX + " " + json.dumps(
+        stats, separators=(",", ":"), allow_nan=False
+    )
+    _write_moe_timeline_line(stats_record, rank)
+    return stats
 
 
 @contextmanager
@@ -571,9 +669,11 @@ try:
         canonical_moe_profile_detail,
         cuda_clock_anchor_attempts,
         cuda_event_host_interval,
+        emit_moe_timeline_record,
         ensure_moe_timeline_collector,
         get_active_moe_timeline,
         host_clock_domain_id,
+        moe_timeline_retain_completed_limit,
         moe_timeline_scope,
         record_moe_timeline_counter,
         record_moe_timeline_event,

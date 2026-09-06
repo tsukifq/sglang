@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
-import json
 import logging
 import os
 import time
@@ -50,6 +49,7 @@ from sglang.srt.layers.moe.profiling import (
     calibrated_event_timing_guard_ns,
     cuda_clock_anchor_attempts,
     cuda_event_host_interval,
+    emit_moe_timeline_record,
     ensure_moe_timeline_collector,
     host_clock_domain_id,
     moe_timeline_scope,
@@ -842,7 +842,7 @@ class FusedMoE(torch.nn.Module):
                 "arrival_timestamps": arrival_timestamps,
                 "component_profile": component_profile,
             }
-            print("DEEPEP_ARRIVAL_TIMELINE " + json.dumps(payload), flush=True)
+            emit_moe_timeline_record("DEEPEP_ARRIVAL_TIMELINE", payload)
 
         submit_moe_timeline_collection(collect)
         defer_state["done_ns"] = time.monotonic_ns()
@@ -1311,7 +1311,7 @@ class FusedMoE(torch.nn.Module):
                 "breakdown": breakdown,
                 "component_profile": component_profile,
             }
-            print("DEEPEP_BASELINE_TIMELINE " + json.dumps(payload), flush=True)
+            emit_moe_timeline_record("DEEPEP_BASELINE_TIMELINE", payload)
 
         submit_moe_timeline_collection(collect)
         defer_state["done_ns"] = time.monotonic_ns()

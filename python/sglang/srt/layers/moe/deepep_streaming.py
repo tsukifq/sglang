@@ -9,7 +9,6 @@ kernels.  The regular DeepEP path remains the default.
 
 from __future__ import annotations
 
-import json
 import inspect
 import os
 import time
@@ -30,6 +29,7 @@ from sglang.srt.layers.moe.profiling import (
     build_moe_component_profile,
     canonical_moe_profile_detail,
     cuda_event_host_interval,
+    emit_moe_timeline_record,
     submit_moe_timeline_collection,
 )
 from sglang.srt.layers.moe.streaming_timeline import source_lane_records
@@ -419,9 +419,9 @@ def _emit_streaming_timeline(
     dispatch: DeepEPStreamingDispatch,
     context: dict[str, Any],
     origin: torch.cuda.Event,
-    dispatch_done: torch.cuda.Event,
+    dispatch_done: torch.cuda.Event | None,
     lane_events: Sequence[dict[str, Any]],
-    reduce_start: torch.cuda.Event,
+    reduce_start: torch.cuda.Event | None,
     reduce_done: torch.cuda.Event,
 ) -> None:
     """Queue one streaming sample for collection off the serving thread."""
@@ -585,7 +585,7 @@ def _emit_streaming_timeline(
                 },
                 "component_profile": component_profile,
             }
-            print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
+            emit_moe_timeline_record("DEEPEP_STREAMING_TIMELINE", payload)
             return
 
         assert psum_host is not None
@@ -862,7 +862,7 @@ def _emit_streaming_timeline(
             },
             "component_profile": component_profile,
         }
-        print("DEEPEP_STREAMING_TIMELINE " + json.dumps(payload), flush=True)
+        emit_moe_timeline_record("DEEPEP_STREAMING_TIMELINE", payload)
 
     submit_moe_timeline_collection(collect)
     defer_state["done_ns"] = time.monotonic_ns()
@@ -950,11 +950,14 @@ def _launch_streaming_moe_lanes(
     timeline_enabled = timeline_context is not None
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
+    full_timeline_enabled = (
+        timeline_enabled and timeline_context["profile_detail"] != "arrival"
+    )
     # Host readiness order is not source-rank order. Keep metadata indexed by
     # the lane that owns the events, just like expert_psum and route_weights.
     lane_timeline: list[dict[str, Any]] = [{} for _ in range(lanes)]
     dispatch_done = None
-    if timeline_enabled:
+    if full_timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
         dispatch_done = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(profile_stream):
@@ -1016,16 +1019,24 @@ def _launch_streaming_moe_lanes(
         )
         with torch.cuda.stream(stream):
             gemm_start = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             gemm_done = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             return_start = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             return_done = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             if gemm_start is not None:
                 gemm_start.record(stream)
@@ -1058,7 +1069,7 @@ def _launch_streaming_moe_lanes(
             lane_finalized = torch.cuda.Event()
             lane_finalized.record(stream)
             returned.append(lane_finalized)
-            if timeline_enabled:
+            if full_timeline_enabled:
                 lane_timeline[lane] = {
                     "source_rank": lane,
                     "gemm_start": gemm_start,
@@ -1085,7 +1096,9 @@ def _launch_streaming_moe_lanes(
     # the four lane pipelines remain asynchronous and the host never blocks.
     for done in returned:
         source_stream.wait_event(done)
-    reduce_start = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+    reduce_start = (
+        torch.cuda.Event(enable_timing=True) if full_timeline_enabled else None
+    )
     reduce_done = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
     if reduce_start is not None:
         reduce_start.record(source_stream)
@@ -1210,11 +1223,14 @@ def _launch_streaming_moe_waves(
     timeline_enabled = timeline_context is not None
     if timeline_enabled != (timeline_origin is not None):
         raise ValueError("timeline context and origin must be provided together")
+    full_timeline_enabled = (
+        timeline_enabled and timeline_context["profile_detail"] != "arrival"
+    )
     lane_timeline: list[dict[str, Any]] = [
         {} for _ in range(lanes)
     ]
     dispatch_done = None
-    if timeline_enabled:
+    if full_timeline_enabled:
         profile_stream = torch.cuda.Stream(priority=0)
         dispatch_done = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(profile_stream):
@@ -1279,10 +1295,14 @@ def _launch_streaming_moe_waves(
         stream = wave_streams[wave_index]
         with torch.cuda.stream(stream):
             gemm_start = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             gemm_done = (
-                torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+                torch.cuda.Event(enable_timing=True)
+                if full_timeline_enabled
+                else None
             )
             if gemm_start is not None:
                 gemm_start.record(stream)
@@ -1317,12 +1337,12 @@ def _launch_streaming_moe_waves(
             with torch.cuda.stream(lane_stream):
                 return_start = (
                     torch.cuda.Event(enable_timing=True)
-                    if timeline_enabled
+                    if full_timeline_enabled
                     else None
                 )
                 return_done = (
                     torch.cuda.Event(enable_timing=True)
-                    if timeline_enabled
+                    if full_timeline_enabled
                     else None
                 )
                 if return_start is not None:
@@ -1339,7 +1359,7 @@ def _launch_streaming_moe_waves(
                 lane_finalized = torch.cuda.Event()
                 lane_finalized.record(lane_stream)
                 returned[lane] = lane_finalized
-                if timeline_enabled:
+                if full_timeline_enabled:
                     lane_timeline[lane] = {
                         "source_rank": lane,
                         "gemm_start": gemm_start,
@@ -1358,7 +1378,7 @@ def _launch_streaming_moe_waves(
     for done in completed_returns:
         source_stream.wait_event(done)
     reduce_start = (
-        torch.cuda.Event(enable_timing=True) if timeline_enabled else None
+        torch.cuda.Event(enable_timing=True) if full_timeline_enabled else None
     )
     reduce_done = torch.cuda.Event(enable_timing=True) if timeline_enabled else None
     if reduce_start is not None:
