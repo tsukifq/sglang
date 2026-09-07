@@ -68,18 +68,29 @@ def is_deepep_v2_sync_baseline_enabled() -> bool:
     )
 
 
-def is_deepep_streaming_rank_merge_enabled() -> bool:
-    """Coalesce equal experts across ready source lanes on the owner rank."""
+def is_deepep_streaming_rank_merge_enabled(
+    *, supported: bool = False, wave_size: int = 1
+) -> bool:
+    """Auto-enable rank merge only for a supported layout and multi-lane wave."""
 
-    return os.getenv(
-        "SGLANG_DEEPEP_STREAMING_RANK_MERGE", "0"
-    ).lower() not in (
+    configured = os.getenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE")
+    if configured is None:
+        return supported and wave_size > 1
+    return configured.lower() not in (
         "",
         "0",
         "false",
         "no",
         "n",
     )
+
+
+def is_deepep_streaming_batched_return_enabled() -> bool:
+    """Batch all source returns after a full rank-merged wave."""
+
+    return os.getenv(
+        "SGLANG_DEEPEP_STREAMING_BATCHED_RETURN", "0"
+    ).lower() not in ("", "0", "false", "no", "n")
 
 
 def configure_deepep_streaming_environment() -> None:
@@ -125,13 +136,16 @@ def _resolve_streaming_wave_size(
 
     configured = os.getenv("SGLANG_DEEPEP_STREAMING_WAVE_SIZE")
     if configured is None:
-        return (
-            4
-            if device_major >= 10
-            and lanes % 4 == 0
-            and supports_repeated_weights
-            else 1
-        )
+        if device_major >= 10 and supports_repeated_weights:
+            # EP8 profiling shows that the second four-lane wave costs more
+            # than it hides for the common ToolAgent prefill distribution.
+            # Prefer one low-overhead owner-rank GEMM and retain wave=4 as an
+            # explicit opt-in while the dynamic break-even gate is developed.
+            if lanes % 8 == 0:
+                return 8
+            if lanes % 4 == 0:
+                return 4
+        return 1
 
     wave_size = int(configured)
     if wave_size <= 0:
@@ -143,6 +157,25 @@ def _resolve_streaming_wave_size(
             "SGLANG_DEEPEP_STREAMING_WAVE_SIZE=1"
         )
     return wave_size
+
+
+def _rank_merged_input_scale_view(
+    storage: torch.Tensor, wave_index: int, wave_rows: int
+) -> torch.Tensor:
+    """Return a compact column-major scale matrix for one rank-merge wave."""
+
+    if storage.ndim != 3 or storage.size(2) != wave_rows:
+        raise ValueError(
+            "rank-merge scale storage must be [waves, scale_groups, wave_rows]"
+        )
+    if not 0 <= wave_index < storage.size(0):
+        raise ValueError("rank-merge scale wave index is out of range")
+    if storage.stride(2) != 1 or storage.stride(1) != wave_rows:
+        raise ValueError("rank-merge scale storage must be compact per wave")
+    view = storage[wave_index].t()
+    if view.stride(0) != 1 or view.stride(1) != wave_rows:
+        raise ValueError("rank-merge input scales must be column-major")
+    return view
 
 
 def _iter_ready_cuda_events(
@@ -615,6 +648,8 @@ def _emit_streaming_timeline(
                     "compute_group_id": events.get(
                         "compute_group_id", source_rank
                     ),
+                    "return_scope": events.get("return_scope", "lane"),
+                    "return_group_id": events.get("return_group_id", source_rank),
                     **_lane_layout_from_psum(psum),
                     "gemm_start_ms": ready_ms,
                     "gemm_done_ms": gemm_done_ms,
@@ -678,6 +713,8 @@ def _emit_streaming_timeline(
                     "counters": {
                         "compute_scope": lane["compute_scope"],
                         "compute_group_id": lane["compute_group_id"],
+                        "return_scope": lane["return_scope"],
+                        "return_group_id": lane["return_group_id"],
                         "useful_rows": lane["useful_rows"],
                         "active_span_rows": lane["active_span_rows"],
                         "alignment_hole_rows": lane["alignment_hole_rows"],
@@ -1316,6 +1353,56 @@ def _launch_streaming_moe_waves(
             if tensor is not None:
                 tensor.record_stream(stream)
 
+        batched_return = (
+            is_deepep_streaming_batched_return_enabled()
+            and route_weights_applied
+            and len(wave_ranges) == 1
+            and start == 0
+            and stop == lanes
+        )
+        if batched_return:
+            with torch.cuda.stream(stream):
+                dispatch.transport_event.current_stream_wait()
+                return_start = (
+                    torch.cuda.Event(enable_timing=True)
+                    if full_timeline_enabled
+                    else None
+                )
+                return_done = (
+                    torch.cuda.Event(enable_timing=True)
+                    if full_timeline_enabled
+                    else None
+                )
+                if return_start is not None:
+                    return_start.record(stream)
+                dispatch.buffer.streaming_combine_return_many(
+                    lane_output, dispatch.src_metadata, dispatch.generation
+                )
+                for lane in range(lanes):
+                    release_streaming_lane(lane, dispatch.generation)
+                if return_done is not None:
+                    return_done.record(stream)
+                batch_finalized = torch.cuda.Event()
+                batch_finalized.record(stream)
+            for tensor in (*dispatch_tensors, *persistent_tensors, lane_output):
+                if tensor is not None:
+                    tensor.record_stream(stream)
+            for lane in range(lanes):
+                returned[lane] = batch_finalized
+                if full_timeline_enabled:
+                    lane_timeline[lane] = {
+                        "source_rank": lane,
+                        "gemm_start": gemm_start,
+                        "gemm_done": gemm_done,
+                        "return_start": return_start,
+                        "return_done": return_done,
+                        "return_scope": "batch",
+                        "return_group_id": wave_index,
+                        "compute_scope": "wave",
+                        "compute_group_id": wave_index,
+                    }
+            continue
+
         for lane in range(start, stop):
             lane_stream = streams[lane]
             lane_stream.wait_event(wave_compute_done)
@@ -1671,15 +1758,30 @@ def launch_fp8_streaming_moe(
     down_input = None
     down_input_scale = None
     packed_lane_quant = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-    rank_merge_enabled = is_deepep_streaming_rank_merge_enabled()
-    if rank_merge_enabled and not (
+    rank_merge_supported = (
         is_fp4_expert
         and packed_lane_quant
         and dispatch.sf.dtype == torch.int32
-    ):
+    )
+    wave_size = _resolve_streaming_wave_size(
+        lanes=lanes,
+        device_major=torch.cuda.get_device_capability(dispatch.x.device)[0],
+        grouped_gemm=deep_gemm.m_grouped_fp8_gemm_nt_contiguous,
+    )
+    if wave_size > 1 and lanes % wave_size != 0:
+        raise ValueError(f"wave_size={wave_size} must divide {lanes} lanes")
+    rank_merge_enabled = is_deepep_streaming_rank_merge_enabled(
+        supported=rank_merge_supported, wave_size=wave_size
+    )
+    if rank_merge_enabled and not rank_merge_supported:
         raise RuntimeError(
             "rank-merged streaming currently requires FP8 activations with "
             "packed UE8M0 scales and MXFP4 expert weights"
+        )
+    if rank_merge_enabled and wave_size <= 1:
+        raise RuntimeError(
+            "rank-merged streaming requires "
+            "SGLANG_DEEPEP_STREAMING_WAVE_SIZE greater than one"
         )
     use_masked_activation = packed_lane_quant
     lane_down_input_buffer = None
@@ -1721,7 +1823,7 @@ def launch_fp8_streaming_moe(
             device=dispatch.x.device,
         )
         rank_merged_input_scale_storage = torch.empty(
-            (dispatch.sf.size(2), total_lane_rows),
+            (lanes // wave_size, dispatch.sf.size(2), wave_size * lane_capacity),
             dtype=dispatch.sf.dtype,
             device=dispatch.x.device,
         )
@@ -1818,19 +1920,7 @@ def launch_fp8_streaming_moe(
         )
         return transient_tensors
 
-    wave_size = _resolve_streaming_wave_size(
-        lanes=lanes,
-        device_major=torch.cuda.get_device_capability(dispatch.x.device)[0],
-        grouped_gemm=deep_gemm.m_grouped_fp8_gemm_nt_contiguous,
-    )
-    if rank_merge_enabled and wave_size <= 1:
-        raise RuntimeError(
-            "rank-merged streaming requires "
-            "SGLANG_DEEPEP_STREAMING_WAVE_SIZE greater than one"
-        )
     if wave_size > 1:
-        if lanes % wave_size != 0:
-            raise ValueError(f"wave_size={wave_size} must divide {lanes} lanes")
         if streams is None:
             streams = tuple(torch.cuda.Stream(priority=0) for _ in range(lanes))
         if drain_stream is None:
@@ -1862,12 +1952,11 @@ def launch_fp8_streaming_moe(
                 merged_x = rank_merged_x_buffer.narrow(
                     0, merged_row_start, wave_rows
                 )
-                merged_input_scale_storage = (
-                    rank_merged_input_scale_storage.narrow(
-                        1, merged_row_start, wave_rows
-                    )
+                merged_input_scale = _rank_merged_input_scale_view(
+                    rank_merged_input_scale_storage,
+                    start // wave_size,
+                    wave_rows,
                 )
-                merged_input_scale = merged_input_scale_storage.t()
                 pack_rank_merged_rows(
                     dispatch.x[start:stop], merged_x, layout
                 )
@@ -1928,7 +2017,7 @@ def launch_fp8_streaming_moe(
                 )
                 return (
                     merged_x,
-                    merged_input_scale_storage,
+                    merged_input_scale,
                     merged_result,
                     layout.source_starts,
                     layout.counts,

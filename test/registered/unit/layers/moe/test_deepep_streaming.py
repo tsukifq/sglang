@@ -13,9 +13,11 @@ from sglang.srt.layers.moe.deepep_streaming import (
     _lane_layout_from_psum,
     _launch_streaming_moe_lanes,
     _launch_streaming_moe_waves,
+    _rank_merged_input_scale_view,
     _require_per_lane_release,
     _resolve_streaming_wave_size,
     configure_deepep_streaming_environment,
+    is_deepep_streaming_batched_return_enabled,
     is_deepep_streaming_rank_merge_enabled,
     is_deepep_v2_sync_baseline_enabled,
     launch_bf16_streaming_moe,
@@ -89,6 +91,12 @@ def test_streaming_wave_size_tracks_loaded_deep_gemm_api(monkeypatch):
     )
     assert (
         _resolve_streaming_wave_size(
+            lanes=8, device_major=10, grouped_gemm=current_api
+        )
+        == 8
+    )
+    assert (
+        _resolve_streaming_wave_size(
             lanes=4, device_major=10, grouped_gemm=stale_api
         )
         == 1
@@ -99,6 +107,29 @@ def test_streaming_wave_size_tracks_loaded_deep_gemm_api(monkeypatch):
         _resolve_streaming_wave_size(
             lanes=4, device_major=10, grouped_gemm=stale_api
         )
+
+
+def test_rank_merged_input_scales_are_compact_for_each_wave():
+    storage = torch.empty((2, 7, 128), dtype=torch.int32)
+
+    first = _rank_merged_input_scale_view(storage, 0, 128)
+    second = _rank_merged_input_scale_view(storage, 1, 128)
+
+    assert first.shape == (128, 7)
+    assert first.stride() == (1, 128)
+    assert second.shape == (128, 7)
+    assert second.stride() == (1, 128)
+    assert second.data_ptr() - first.data_ptr() == 7 * 128 * storage.element_size()
+
+
+def test_rank_merged_input_scales_reject_cross_wave_stride():
+    shared = torch.empty((7, 256), dtype=torch.int32)
+    cross_wave = shared.narrow(1, 128, 128).unsqueeze(0)
+    second_wave = cross_wave[0].t()
+
+    assert second_wave.stride() == (1, 256)
+    with pytest.raises(ValueError, match="compact per wave"):
+        _rank_merged_input_scale_view(cross_wave, 0, 128)
 
 
 def test_streaming_wave_size_reads_pybind_doc_when_signature_is_missing(
@@ -215,11 +246,52 @@ def test_v2_sync_baseline_gate_is_explicit(monkeypatch):
     assert all_lane_wait < barrier_event < lane_compute
 
 
-def test_streaming_rank_merge_is_explicit_opt_in(monkeypatch):
+def test_streaming_rank_merge_defaults_on_for_supported_fp4(monkeypatch):
     monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", raising=False)
     assert not is_deepep_streaming_rank_merge_enabled()
+    assert is_deepep_streaming_rank_merge_enabled(supported=True, wave_size=4)
     monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", "1")
     assert is_deepep_streaming_rank_merge_enabled()
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", "0")
+    assert not is_deepep_streaming_rank_merge_enabled(supported=True, wave_size=4)
+
+
+@pytest.mark.parametrize("wave_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("layout_supported", [False, True])
+def test_rank_merge_auto_respects_layout_and_resolved_wave(
+    monkeypatch, wave_size, layout_supported
+):
+    monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", raising=False)
+    assert is_deepep_streaming_rank_merge_enabled(
+        supported=layout_supported, wave_size=wave_size
+    ) == (layout_supported and wave_size > 1)
+
+
+def test_rank_merge_explicit_override_remains_visible_to_validation(monkeypatch):
+    # The launcher must still reject an explicitly forced incompatible mode.
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", "1")
+    assert is_deepep_streaming_rank_merge_enabled(supported=True, wave_size=1)
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_RANK_MERGE", "0")
+    assert not is_deepep_streaming_rank_merge_enabled(supported=True, wave_size=4)
+
+
+def test_streaming_batched_return_is_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("SGLANG_DEEPEP_STREAMING_BATCHED_RETURN", raising=False)
+    assert not is_deepep_streaming_batched_return_enabled()
+
+    monkeypatch.setenv("SGLANG_DEEPEP_STREAMING_BATCHED_RETURN", "1")
+    assert is_deepep_streaming_batched_return_enabled()
+
+
+def test_streaming_batched_return_precedes_lane_release():
+    source = inspect.getsource(_launch_streaming_moe_waves)
+    batched_return = source.index("streaming_combine_return_many(")
+    lane_release = source.index(
+        "release_streaming_lane(lane, dispatch.generation)", batched_return
+    )
+    batch_finalized = source.index("batch_finalized.record(stream)", lane_release)
+
+    assert batched_return < lane_release < batch_finalized
 
 
 def test_streaming_dispatch_rejects_incomplete_runtime_view():
