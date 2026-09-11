@@ -1391,7 +1391,12 @@ class FusedMoE(torch.nn.Module):
         drain_stream = self._deepep_streaming_drain_streams[wavefront_slot]
         activation_stream = self._deepep_streaming_activation_streams[wavefront_slot]
         if self._deepep_streaming_fp8:
-            result = launch_fp8_streaming_moe(
+            fp8_launcher = launch_fp8_streaming_moe
+            if os.getenv("ASYNC_MOE_PREPARED_SERVICE", "0") == "1":
+                # Explicit experiment adapter; bounded cross-layer scratch pool.
+                from profiler.prepared_service import get_launcher
+                fp8_launcher = get_launcher(fp8_launcher)
+            result = fp8_launcher(
                 dispatch,
                 self.w13_weight,
                 self.w2_weight,
