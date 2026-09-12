@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -684,6 +685,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         *,
         wavefront_slot: int = 0,
         num_wavefront_slots: int = 1,
+        physical_topk_ids: torch.Tensor | None = None,
+        physical_num_experts: int | None = None,
+        source_active: bool = True,
     ):
         """Submit ElasticBuffer dispatch and export its lane-local sidecar."""
 
@@ -701,9 +705,24 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 f"{hidden_states.shape[0]} > {self.num_max_dispatch_tokens_per_rank}"
             )
 
-        topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
+        if not isinstance(source_active, bool):
+            raise TypeError("streaming source_active must be bool")
+        topk_ids = (
+            topk_output.topk_ids.to(torch.int64).contiguous()
+            if physical_topk_ids is None
+            else physical_topk_ids
+        )
+        if topk_ids.dtype != torch.int64 or not topk_ids.is_contiguous():
+            raise ValueError("physical streaming top-k ids must be contiguous int64")
+        num_experts = self.num_experts if physical_num_experts is None else physical_num_experts
+        if num_experts <= 0 or num_experts % self.group.size() != 0:
+            raise ValueError("physical expert count must divide evenly across the EP group")
         topk_weights = topk_output.topk_weights.contiguous()
         hidden_states = hidden_states.contiguous()
+        if not source_active:
+            hidden_states = hidden_states[:0]
+            topk_ids = topk_ids[:0]
+            topk_weights = topk_weights[:0]
         dispatch_payload = hidden_states
         if self.use_fp8:
             use_tma_aligned_scales = (
@@ -741,7 +760,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             dispatch_payload,
             topk_idx=topk_ids,
             topk_weights=topk_weights,
-            num_experts=self.num_experts,
+            num_experts=num_experts,
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             expert_alignment=128,
             previous_event=previous_event,
@@ -1220,7 +1239,19 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         self.streaming_enabled = is_deepep_streaming_enabled()
-        self.streaming_num_wavefront_slots = 1
+        split_mode = os.getenv("ASYNC_MOE_ONLINE_RESIDENT_MODE", "").lower()
+        self.streaming_num_wavefront_slots = (
+            2
+            if split_mode
+            in (
+                "split-layout",
+                "split",
+                "adaptive-layout",
+                "adaptive",
+                "adaptive-plain",
+            )
+            else 1
+        )
         if self.streaming_enabled:
             configure_deepep_streaming_environment()
             if _is_npu or is_hip():
@@ -1306,6 +1337,9 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
         *,
         wavefront_slot: Optional[int] = None,
+        physical_topk_ids: Optional[torch.Tensor] = None,
+        physical_num_experts: Optional[int] = None,
+        source_active: bool = True,
     ):
         if not self.streaming_enabled:
             raise RuntimeError("streaming DeepEP is not enabled")
@@ -1328,6 +1362,9 @@ class DeepEPDispatcher(BaseDispatcher):
             topk_output,
             wavefront_slot=wavefront_slot,
             num_wavefront_slots=self.streaming_num_wavefront_slots,
+            physical_topk_ids=physical_topk_ids,
+            physical_num_experts=physical_num_experts,
+            source_active=source_active,
         )
 
     def dispatch_a(

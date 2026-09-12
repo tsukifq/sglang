@@ -1355,17 +1355,128 @@ class FusedMoE(torch.nn.Module):
                 "counters": {},
             }
 
+        resident = None
+        if os.getenv("ASYNC_MOE_ONLINE_RESIDENT_MODE", "").lower() not in (
+            "", "0", "false", "no", "n"
+        ):
+            from profiler.online_resident import prepare as prepare_resident
+
+            resident = prepare_resident(self, topk_output.topk_ids)
+        if resident is not None and resident.split_group is not None:
+            return self._run_deepep_resident_split(
+                hidden_states,
+                topk_output,
+                resident,
+                timeline_context=timeline_context,
+                timeline_origin=timeline_origin,
+                dispatch_timeline=dispatch_timeline,
+            )
         with moe_timeline_scope(dispatch_timeline):
             dispatch = self.dispatcher.dispatch_streaming(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
                 wavefront_slot=wavefront_slot,
+                physical_topk_ids=(resident.topk_ids if resident is not None else None),
+                physical_num_experts=(
+                    resident.physical_num_experts if resident is not None else None
+                ),
             )
         return self._run_deepep_streaming_dispatch(
             dispatch,
             timeline_context=timeline_context,
             timeline_origin=timeline_origin,
+            resident_weights=(resident.weights if resident is not None else None),
         ).output
+
+    def _run_deepep_resident_split(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        resident,
+        *,
+        timeline_context: Optional[dict],
+        timeline_origin: Optional[torch.cuda.Event],
+        dispatch_timeline: Optional[dict],
+    ) -> torch.Tensor:
+        """Prequeue one early-source group and one residual-source group."""
+
+        if os.getenv("ASYNC_MOE_PREPARED_SERVICE", "0") != "1" or os.getenv(
+            "ASYNC_MOE_SERVICE_BINDING", "0"
+        ) != "1":
+            raise RuntimeError(
+                "resident split requires the prepared bound service path"
+            )
+        if self.dispatcher.streaming_num_wavefront_slots != 2:
+            raise RuntimeError("resident split requires two ElasticBuffer slots")
+        source_streams = getattr(self, "_async_moe_split_source_streams", None)
+        if source_streams is None:
+            source_streams = tuple(torch.cuda.Stream(priority=0) for _ in range(2))
+            self._async_moe_split_source_streams = source_streams
+        input_ready = torch.cuda.Event()
+        input_ready.record(torch.cuda.current_stream(hidden_states.device))
+        results = []
+        for group_index, source_stream in enumerate(source_streams):
+            source_active = resident.split_group == group_index
+            with torch.cuda.stream(source_stream):
+                if source_active:
+                    source_stream.wait_event(input_ready)
+                group_timeline = (
+                    None
+                    if dispatch_timeline is None
+                    else {
+                        "events": dict(dispatch_timeline["events"]),
+                        "recorded": set(),
+                        "counters": {
+                            **dispatch_timeline.get("counters", {}),
+                            "resident_split_group": group_index,
+                        },
+                    }
+                )
+                with moe_timeline_scope(group_timeline):
+                    dispatch = self.dispatcher.dispatch_streaming(
+                        hidden_states=hidden_states,
+                        topk_output=topk_output,
+                        wavefront_slot=group_index,
+                        physical_topk_ids=resident.topk_ids,
+                        physical_num_experts=resident.physical_num_experts,
+                        source_active=source_active,
+                    )
+                group_context = (
+                    None
+                    if timeline_context is None
+                    else {**timeline_context, "resident_split_group": group_index}
+                )
+                results.append(
+                    self._run_deepep_streaming_dispatch(
+                        dispatch,
+                        timeline_context=group_context,
+                        timeline_origin=timeline_origin,
+                        resident_weights=resident.weights,
+                        resident_binding_variant=f"{resident.binding_prefix}{group_index}",
+                    )
+                )
+        current_stream = torch.cuda.current_stream(hidden_states.device)
+        owned_result = results[resident.split_group]
+        local_join = os.getenv(
+            "ASYNC_MOE_ONLINE_RESIDENT_LOCAL_JOIN", "1"
+        ).strip().lower()
+        if local_join not in ("0", "1", "false", "true", "no", "yes"):
+            raise ValueError(
+                "ASYNC_MOE_ONLINE_RESIDENT_LOCAL_JOIN must be boolean"
+            )
+        joined_results = (
+            (owned_result,)
+            if local_join in ("1", "true", "yes")
+            else tuple(results)
+        )
+        with torch.cuda.stream(current_stream):
+            # Both groups have already been submitted in identical order on
+            # every rank. The local-join experiment lets early ranks proceed;
+            # the full-join control isolates that scheduling effect while
+            # retaining the same two dispatches, weights, and split gate.
+            for result in joined_results:
+                result.source_ready.current_stream_wait()
+        return owned_result.output
 
     def _run_deepep_streaming_dispatch(
         self,
@@ -1373,6 +1484,10 @@ class FusedMoE(torch.nn.Module):
         *,
         timeline_context: Optional[dict] = None,
         timeline_origin: Optional[torch.cuda.Event] = None,
+        resident_weights: Optional[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
+        resident_binding_variant: Optional[str] = None,
     ) -> DeepEPStreamingLayerResult:
         """Consume one request slot without joining another slot's resources."""
 
@@ -1392,16 +1507,30 @@ class FusedMoE(torch.nn.Module):
         activation_stream = self._deepep_streaming_activation_streams[wavefront_slot]
         if self._deepep_streaming_fp8:
             fp8_launcher = launch_fp8_streaming_moe
-            if os.getenv("ASYNC_MOE_PREPARED_SERVICE", "0") == "1":
+            prepared_service = os.getenv("ASYNC_MOE_PREPARED_SERVICE", "0") == "1"
+            if prepared_service:
                 # Explicit experiment adapter; bounded cross-layer scratch pool.
                 from profiler.prepared_service import get_launcher
+
                 fp8_launcher = get_launcher(fp8_launcher)
+            if resident_weights is None:
+                w13_weight = self.w13_weight
+                w2_weight = self.w2_weight
+                w13_scale = self.w13_weight_scale_inv
+                w2_scale = self.w2_weight_scale_inv
+            else:
+                w13_weight, w2_weight, w13_scale, w2_scale = resident_weights
+            binding_kwargs = (
+                {"_async_moe_binding_variant": resident_binding_variant}
+                if prepared_service and resident_binding_variant is not None
+                else {}
+            )
             result = fp8_launcher(
                 dispatch,
-                self.w13_weight,
-                self.w2_weight,
-                self.w13_weight_scale_inv,
-                self.w2_weight_scale_inv,
+                w13_weight,
+                w2_weight,
+                w13_scale,
+                w2_scale,
                 self.quant_method.weight_block_size,
                 is_fp4_expert=self._deepep_streaming_fp4,
                 streams=lane_streams,
@@ -1410,6 +1539,7 @@ class FusedMoE(torch.nn.Module):
                 swiglu_limit=self.moe_runner_config.swiglu_limit,
                 timeline_context=timeline_context,
                 timeline_origin=timeline_origin,
+                **binding_kwargs,
             )
         else:
             result = launch_bf16_streaming_moe(
